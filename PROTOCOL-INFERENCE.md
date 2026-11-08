@@ -247,7 +247,7 @@ node scripts/probe-e2e.mjs
 
 ```bash
 node scripts/detect-local-login.mjs
-PHANTHY_ALLOW_DEVICE_REGISTER=1 PHANTHY_ALLOW_CHECKIN=1 node scripts/probe-live.mjs all
+node scripts/probe-live.mjs all
 node scripts/probe-endpoints.mjs all
 ```
 

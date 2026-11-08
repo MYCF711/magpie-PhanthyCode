@@ -23,7 +23,6 @@ const home = mkdtempSync(join(tmpdir(), "pw-mount-"))
 process.env.USERPROFILE = home
 process.env.HOME = home
 delete process.env.PHANTHY_ALLOW_DEVICE_REGISTER
-delete process.env.PHANTHY_ALLOW_CHECKIN
 
 const entry = await import("../index.mjs")
 const { _internal, PhanthyCodeAuthPlugin } = entry
@@ -305,21 +304,32 @@ test("usage 按 uid 分账号缓存：两个账号不共用一份读数", async 
   assert.equal(hitsExact(USAGE_PATH), 2, "不同 uid 必须各自取一次（不能用可重名的 accountId 当 key）")
 })
 
-test("checkin 按账号单飞：并发两次只发一次读取；开关关闭时如实说 failed（不是「没有签到活动」）", async () => {
-  readyInstallation("acct-checkin")
-  const { hits, fetchImpl } = counter(() => json({ wallet: { availablePoints: 5 }, daily: { server_date: "2026-11-08" } }))
-  const plugin = await PhanthyCodeAuthPlugin({}, { fetch: fetchImpl })
-  const getAuth = async () => ({ type: "oauth", access: "access-checkin", uid: "acct-checkin" })
+test("checkin 按账号单飞：并发两次的请求数与单次相同（0.1.0 起没有「自动领取」开关）", async () => {
+  // 0.1.0 去掉了 `PHANTHY_ALLOW_CHECKIN` —— magpie 是独立进程，用户设不到那个环境变量，
+  // 于是签到对所有人都是死的。真实领取本身是幂等的（`daily:<installationId>:<day>`），
+  // 官方桌面端启动时也直接领。
+  //
+  // 一次 checkin 会打 3 次 rewards（status → claim 前账单 → claim 后账单），
+  // 所以判据不是「等于 1」，而是「并发两次 == 单次」—— 单飞合并的是**整轮**。
+  const run = async (account, times) => {
+    readyInstallation(account)
+    const { hits, fetchImpl } = counter(() => json({ wallet: { availablePoints: 5 }, daily: { server_date: "2026-11-08" } }))
+    const plugin = await PhanthyCodeAuthPlugin({}, { fetch: fetchImpl })
+    const getAuth = async () => ({ type: "oauth", access: `access-${account}`, uid: account })
+    const results = await Promise.all(
+      Array.from({ length: times }, () => plugin.auth.checkin(getAuth, { id: "phanthycode" })),
+    )
+    return { hits: hits(REWARDS_PATH), results }
+  }
 
-  const [first, second] = await Promise.all([
-    plugin.auth.checkin(getAuth, { id: "phanthycode" }),
-    plugin.auth.checkin(getAuth, { id: "phanthycode" }),
-  ])
+  const one = await run("acct-checkin-one", 1)
+  const two = await run("acct-checkin-two", 2)
 
-  assert.equal(hits(REWARDS_PATH), 1, "同账号并发签到必须合并成一次请求")
-  for (const result of [first, second]) {
-    assert.equal(result.outcome, "failed", "开关关闭 ≠ inactive（HOOKS 二：inactive = 没有签到活动）")
-    assert.match(result.message, /PHANTHY_ALLOW_CHECKIN/)
+  assert.ok(one.hits > 0, "单次 checkin 必须真的发请求")
+  assert.equal(two.hits, one.hits, "并发两次必须合并成一轮（不能翻倍）")
+  for (const result of two.results) {
+    assert.notEqual(result.outcome, "inactive", "不能报「没有签到活动」")
+    assert.equal(/PHANTHY_ALLOW_CHECKIN/.test(result.message ?? ""), false, "不该再让用户去设环境变量")
   }
 })
 
@@ -357,7 +367,6 @@ test("refresh-only 凭据不会被 usage/checkin 的账号 key 误判为未登�
 // 早期实现把 claimed 折成 done，用户看不出「这次到底领没领到」。
 
 test("checkin 真领取成功 → outcome=claimed（不是 done），并带回 credit", async () => {
-  process.env.PHANTHY_ALLOW_CHECKIN = "1"
   try {
     readyInstallation("acct-claim")
     let points = 100
@@ -376,7 +385,6 @@ test("checkin 真领取成功 → outcome=claimed（不是 done），并带回 c
     assert.equal(result.credit, 30, "credit 是前后余额差")
     assert.equal(hits(DAILY_CLAIM_PATH), 1)
   } finally {
-    delete process.env.PHANTHY_ALLOW_CHECKIN
   }
 })
 
@@ -390,7 +398,6 @@ test("checkin 今天已领（上游 409）→ outcome=claimed（不是 done，�
   // 宿主只把 `{outcome, credit, streak, message, until}` 转给 Go，`claimed` 时间戳
   // 由 Go 在 `outcome === "claimed"` 时**自己补**。`done` 没有时间戳 ⇒ magpie 无法
   // 断言「这 300 分是今天的」⇒ 黄灯「回复已签到，但它的签到日可能…」，哪怕 credit 给了。
-  process.env.PHANTHY_ALLOW_CHECKIN = "1"
   try {
     readyInstallation("acct-already")
     const { fetchImpl } = counter((url) => {
@@ -406,6 +413,5 @@ test("checkin 今天已领（上游 409）→ outcome=claimed（不是 done，�
     assert.equal(result.outcome, "claimed", "409 也要报 claimed，否则卡片黄灯")
     assert.notEqual(result.outcome, "done", "done 没有 claimed 时间戳，卡片渲染不成绿灯")
   } finally {
-    delete process.env.PHANTHY_ALLOW_CHECKIN
   }
 })

@@ -55,13 +55,28 @@ export const ICON =
  * [id, 显示名, reasoning 档位]
  *
  * id 取自静态观察到的云端模型清单；上下文 / 倍率 / 模态一律不在这儿声明（见上）。
+ *
+ * ⚠ 这张表必须与**真实目录同形**（2026-11-09 从 `/api/phanthy_code/models` 拉的 13 条）。
+ *   早期写死了 5 条，其中 `claude-opus-4-8` / `claude-sonnet-4-6` **根本不存在**，
+ *   而 `phanthy-fast` 大小写也与真实 id（`Phanthy-fast`）不一致 ——
+ *   用户未登录时看到的就是一份假列表。
+ *
+ *   重新生成：`node scripts/dump-static-models.mjs`
  */
 export const MODELS = [
-  ["phanthy-fast", "Phanthy Fast"],
-  ["phanthy-pro", "Phanthy Pro"],
-  ["phanthy-ultra", "Phanthy Ultra"],
-  ["claude-opus-4-8", "Claude Opus 4.8"],
-  ["claude-sonnet-4-6", "Claude Sonnet 4.6"],
+  ["deepseek-v4.1-flash-1017", "DeepSeek V4.1 Flash"],
+  ["glm-5.2", "GLM-5.2"],
+  ["glm-5.3", "GLM-5.3"],
+  ["glm-5.3-flash", "GLM-5.3 Flash"],
+  ["kimi-k2.7-code", "Kimi K2.7 Code"],
+  ["kimi-k3", "Kimi K3"],
+  ["Phana-5.5o", "Phana 5.5o"],
+  ["Phana-5.5s", "Phana 5.5s"],
+  ["Phano-6.1s", "Phano 6.1s"],
+  ["Phano-6a", "Phano 6a"],
+  ["Phanthy-fast", "Phanthy Fast"],
+  ["Phanthy-pro", "Phanthy Pro"],
+  ["Phanthy-ultra", "Phanthy Ultra"],
 ]
 
 /**
@@ -79,7 +94,9 @@ export function staticModels({ contextOf: lookup = contextOf } = {}) {
       name,
       api: { id, url: BASE, npm: SDK },
       status: "active",
-      ...(Number.isFinite(context) && context > 0 ? { limit: { context: Number(context) } } : {}),
+      // 上下文必须是**正整数**：`0.5` / `NaN` / `0` 都不是合法窗口，
+      // 早期只判 `> 0` 会让 `0.5` 混过去（宿主拿它算 token 预算会得到 0）。
+      ...(Number.isInteger(context) && context > 0 ? { limit: { context } } : {}),
       // config 钩子的静态模型走 modalities；capabilities.input 是 provider.models 路径的字段。
       // 两个都写，避免「只写 capabilities 而 config 路径读不到模态」。
       modalities: { input: ["text"], output: ["text"] },

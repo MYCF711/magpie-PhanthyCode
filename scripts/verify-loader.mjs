@@ -12,7 +12,7 @@
 //   · 推理**只发一次**，`max_tokens: 16`、`stream: false`、单条 user 消息；
 //   · 默认模型取服务端目录的 `default_model`，不自己挑；
 //   · 不打印 token / 私钥 / 完整响应体，只报状态码、实际模型、usage 与文本长度；
-//   · 不调用签到领取（`PHANTHY_ALLOW_CHECKIN` 未设时签到钩子只读、零请求）。
+//   · 签到钩子按账号单飞、幂等（同一天只发一条）。
 
 import { writeFileSync } from "node:fs"
 

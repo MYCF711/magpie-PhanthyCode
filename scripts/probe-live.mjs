@@ -5,7 +5,7 @@
 //
 // 边界：
 //   · 只读本机 `.phanthy-code/.credentials.json` 的 access token（不碰 refresh / 私钥）
-//   · 不领取签到（checkin 在 PHANTHY_ALLOW_CHECKIN!=1 时只读状态）
+//   · 签到默认就会领取（0.1.0 起没有环境变量闸门）
 //   · 任何输出都不含 token 值；只打印长度与 sha8
 
 import { readImportedAccess, summarizeDetection, detectLocalLogin } from "../src/local-import.mjs"

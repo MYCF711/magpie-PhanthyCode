@@ -1,6 +1,6 @@
 // scripts/probe-checkin-live.mjs —— 直接跑生产 checkin 钩子，看它给 magpie 的原始返回
 //
-// 只读（不设 PHANTHY_ALLOW_CHECKIN，走 status 分支）。认证从 magpie 的登录态取，
+// 直接跑生产 checkin 钩子（会真的领取；幂等键保证同一天只发一条）。认证从 magpie 的登录态取，
 // 因为浏览器登录不会生成 `.credentials.json`。
 
 import { readFileSync } from "node:fs"

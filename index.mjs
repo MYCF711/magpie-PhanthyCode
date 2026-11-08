@@ -711,7 +711,6 @@ export const PhanthyCodeAuthPlugin = async (_ctx = {}, _options = {}) => {
             now: () => Date.now(),
           })
 
-          // 默认只读状态（rules：真实 claim 不自动执行）。要领取必须显式开 PHANTHY_ALLOW_CHECKIN=1。
           /**
            * 「今天这条已经发了」→ 用 `claimed`，不是 `done`。
            *
@@ -724,13 +723,8 @@ export const PhanthyCodeAuthPlugin = async (_ctx = {}, _options = {}) => {
            * `claimed` 时间戳是 Go 在 `outcome === "claimed"` 时**自己补**的。
            * `done` 没有时间戳 ⇒ magpie 无法断言「这 300 分是今天的」⇒ 只能渲染成
            * 黄灯「回复已签到，但它的签到日可能…」，哪怕 `credit` 已经给了。
-           *
-           * 语义上也站得住：`dailyLoginReward()` 返回非 null 的含义就是
-           * **今天这条 daily_login 奖励已经发放了**（`grantedAt` 就在今天）。
-           * `claimed` 表达的是「这个账号今天拿到额度了」，不是「这一秒是我们点的」——
-           * message 里会写清「自动领取默认关闭」，不要误导用户以为是我们领的。
            */
-          const todayGranted = (rewards, message) => {
+          const claimedFrom = (rewards, message) => {
             const reward = dailyLoginReward(rewards)
             if (!reward) return null
             const credit = Number(reward.points ?? reward.credit ?? 0)
@@ -743,45 +737,51 @@ export const PhanthyCodeAuthPlugin = async (_ctx = {}, _options = {}) => {
             }
           }
 
-          if (process.env.PHANTHY_ALLOW_CHECKIN !== "1") {
-            const state = await daily.status(auth, identity)
-            if (state.outcome !== "ok") {
-              return { outcome: "failed", message: `签到状态读取失败：${state.reason || "unknown"}` }
-            }
-            // 状态**读到了**就不能报 failed —— 那不是失败。官方桌面端启动时就会 claim，
-            // 所以「今天已经领过」是常态（真机四问暴露过：早期不管读到什么都返回 failed）。
-            const granted = todayGranted(state.rewards, "今日已签到（自动领取默认关闭）")
-            if (granted) return granted
-            // 读到了但今天还没签：这是「没开自动领取」，不是错误，但词表里没有更贴切的
-            // outcome（inactive 的意思是「没有签到活动」）。给出可操作的话，别让用户干瞪眼。
-            return {
-              outcome: "failed",
-              message: "今日尚未签到：自动领取默认关闭，设置 PHANTHY_ALLOW_CHECKIN=1 后重试即可领取",
-            }
+          // ⚠ 0.1.0 起**不再要求 `PHANTHY_ALLOW_CHECKIN=1`**。
+          //
+          //   那个闸门和 `PHANTHY_ALLOW_LOCAL_IMPORT` / `PHANTHY_ALLOW_DEVICE_REGISTER`
+          //   是同一个错：**magpie 是独立进程**，用户在 shell 里设的环境变量它看不到。
+          //   于是「签到」这个功能对所有人都是死的 —— 点「立即签到」只会看到
+          //   「自动领取默认关闭」。
+          //
+          //   而「真实领取」本身是安全的：`POST .../daily-login/claim` 用
+          //   `daily:<installationId>:<day>` 做幂等键，同一天重复调用只会命中同一条
+          //   （服务端回 409，我们映射成 `claimed`）。官方桌面端启动时也是直接领。
+          //
+          //   顺序仍然是「先读状态、已经有就不再发请求」—— 那能省掉一次 POST，
+          //   只是它不是「安全闸门」，是「省一次请求」。
+          const state = await daily.status(auth, identity)
+          if (state.outcome === "ok") {
+            const already = claimedFrom(state.rewards, "今日已签到")
+            if (already) return already
           }
+          // 读不到状态不等于失败：直接往下走 claim，让服务端说了算
 
           const result = await daily.claim(auth, identity)
           if (result.outcome === "signIn") throw asSignInExpired("登录已失效，请重新登录")
-          // HOOKS 二 的 outcome 词表里 claimed 与 done 是两件事：
-          //   claimed = 刚刚签到成功；done = 今天已经签过了。
-          // 早期这里把 claimed 折成 done，用户看不出「这次到底领没领到」（审计 R-05）。
-          if (result.outcome === "claimed") {
-            return {
-              outcome: "claimed",
-              ...(Number.isFinite(result.credit) && result.credit > 0 ? { credit: result.credit } : {}),
-              message: result.message || "今日签到完成",
+          // 真正领取之后：
+          //   · `claimed` = 刚领到，`result.credit` 就是这次给的
+          //   · `done`    = 409 今天已领，`reconcileCheckin` 拿不到金额 ——
+          //                再读一次状态，把今天那条奖励的 `points` / 连续天数补上，
+          //                否则卡片只显示「已签到」没有金额（黄灯）。
+          if (result.outcome === "claimed" || result.outcome === "done") {
+            let credit = result.credit
+            let streak = result.streak
+            if (result.outcome === "done" && !(Number.isFinite(credit) && credit > 0)) {
+              const recheck = await daily.status(auth, identity).catch(() => null)
+              if (recheck?.outcome === "ok") {
+                const reward = dailyLoginReward(recheck.rewards)
+                const points = Number(reward?.points ?? reward?.credit ?? NaN)
+                if (Number.isFinite(points) && points > 0) credit = points
+                const days = dailyLoginStreak(recheck.rewards)
+                if (Number.isFinite(days) && days > 1) streak = days
+              }
             }
-          }
-          // 真正领取之后：`done` 说明今天已经领过（409），也要把 credit/streak 带上，
-          // 否则卡片只会显示「已签到」而没有金额（`claimed` 分支由 `result.credit` 给）。
-          // 409 = 今天已领：同样用 `claimed`（理由见上面 todayGranted 的注释），
-          // 否则卡片又退回黄灯。
-          if (result.outcome === "done") {
             return {
               outcome: "claimed",
-              ...(Number.isFinite(result.credit) && result.credit > 0 ? { credit: result.credit } : {}),
-              ...(Number.isFinite(result.streak) && result.streak > 1 ? { streak: result.streak } : {}),
-              message: "今日已签到",
+              ...(Number.isFinite(credit) && credit > 0 ? { credit } : {}),
+              ...(Number.isFinite(streak) && streak > 1 ? { streak } : {}),
+              message: result.outcome === "claimed" ? result.message || "今日签到完成" : "今日已签到",
             }
           }
           if (result.outcome === "inactive") {
