@@ -35,7 +35,7 @@ provider   phanthycode（模型名 phanthycode/<id>）
 `magpie plugin list` 拿到的才是这个账号真实的全部。
 
 **倍率** = `input_credits_per_million_tokens / 3000`，与官方客户端逐条一致（`0.04x` ~ `1.67x`）。
-厂商**按次固定扣 1 积分**，不按 token —— 只有 `Phanthy-fast` 是 `0.00x`（免费）。
+计费**按 token**（小请求会抹零：画一张 1247 token 的图实测 0 积分），无条件免费的只有 `Phanthy-fast`。
 
 ## 签到
 
