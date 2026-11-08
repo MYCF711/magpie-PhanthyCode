@@ -36,7 +36,7 @@ async function used() {
 }
 
 /** 等 used_credits 稳定（连续两次相同），最多等 tries*gap */
-async function settle(prev, { tries = 10, gapMs = 3000 } = {}) {
+async function settle(prev, { tries = 20, gapMs = 6000 } = {}) {
   let last = await used()
   for (let i = 0; i < tries; i++) {
     if (last.used !== prev.used) {
