@@ -1,0 +1,57 @@
+name: Scorecard supply-chain security
+
+# ⚠ 本文件属于「仓库自己」而不是「模板给派生者」。
+#
+# OpenSSF 官方明确：Scorecard 不在 fork 上运行（有整套 workflow 硬限制 —— 不能有顶层 env、
+# 只有打分这一个 job 能用 id-token）。所以本仓库是 GitHub template repository，
+# 派生出去的插件仓库会原样继承这份 workflow，然后每周白跑一次并失败。
+#
+# 已经在第一步加了 repository 守卫：派生仓库里它直接 skipped，不红。
+# 派生的插件作者也可以直接删掉本文件 —— 它本来就不该跟着走。
+# 如果本仓库的 scripts/create.mjs 有 SKIP_FILES 列表，把这一条也加进去。
+#
+# 为什么要有它：OpenSSF Scorecard 是公开给仓库打分的第三方工具（pnpm 6.9 / 10）。
+# 不加这个 workflow，你的仓库**永远不会被扫描**（api.securityscorecards.dev 查不到），
+# 也就永远不知道自己在供应链那几项上是 0 分还是 10 分。
+# 跑出来的 SARIF 会出现在仓库的 Security → Code scanning 里。
+
+on:
+  branch_protection_rule:
+  schedule:
+    - cron: "30 1 * * 6"
+  push:
+    branches: ["main"]
+
+permissions: read-all
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    # 只在真身仓库跑；派生 / fork 一律跳过（否则派生者的 CI 会长期红）
+    if: false  # 派生插件仓库不跑 Scorecard（本仓库无远端；要开就换成自己的 owner/repo）
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write # 上传 SARIF
+      id-token: write        # 让结果发布到 OpenSSF 的公开数据集（publish_results）
+      contents: read
+      actions: read
+
+    steps:
+      - name: "Checkout code"
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: "Run analysis"
+        uses: ossf/scorecard-action@v2.5.0
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          # 公开仓库设为 true，分数才会出现在 api.securityscorecards.dev 上
+          publish_results: true
+
+      - name: "Upload to code-scanning"
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: results.sarif
+          category: scorecard

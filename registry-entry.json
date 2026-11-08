@@ -1,0 +1,11 @@
+{
+  "package": "magpie-phanthycode",
+  "name": "PhanthyCode 云端",
+  "providers": [
+    "phanthycode"
+  ],
+  "summary": {
+    "en": "Sign in with a PhanthyCode account to use the code.phanthy.com model catalog, usage quota and device-key signing from magpie — the desktop client is not required.",
+    "zh": "用 PhanthyCode 账号签入 code.phanthy.com：模型目录、积分额度与设备密钥签名都由插件自带，不需要安装桌面端。"
+  }
+}

@@ -1,0 +1,71 @@
+#!/bin/sh
+# magpie 插件模板 · 推送前分级门禁。
+# 由 scripts/install-hooks.mjs 安装；改钩子请改这个文件再重装，别改 .git/hooks 里的副本。
+#
+# 为什么分级：CI 的五步（check / test / docs / privacy / pack）在模板上全套只要约 3 秒，
+# 但派生项目会长大。把「每次推送都要等」变成「只有合入点才等」，钩子才不会被绕过。
+#
+#   快档（每次推送）    check.mjs + privacy-scan          —— 目前 0~1 秒
+#   全档（只在合入点）  + npm test + check-docs            —— 目前约 3 秒
+#
+# 合入点 = 推 main / 首次推一个新分支（git push -u）/ PLUGIN_FULL=1
+# 逃生门（只跳过这一次）= PLUGIN_SKIP_HOOK=1 git push
+if [ "${PLUGIN_SKIP_HOOK:-0}" = "1" ]; then
+  echo "pre-push: 已按 PLUGIN_SKIP_HOOK=1 跳过本地门禁" >&2
+  exit 0
+fi
+
+full=0
+[ "${PLUGIN_FULL:-0}" = "1" ] && full=1
+zero=0000000000000000000000000000000000000000
+push_main=0
+refs_need_gate=0
+while read local_ref local_sha remote_ref remote_sha; do
+  # 只推 tag = 发布动作，不是分支推送。release.mjs 已经把 check / test / pack 跑过一遍，
+  # 这里再跑一次既重复、又会在偶发波动时把 tag 卡住（2026-11-04 实装时真卡过一次）。
+  case "$local_ref" in
+    refs/tags/*) continue;;
+  esac
+  refs_need_gate=1
+  case "$remote_ref" in
+    refs/heads/main|refs/heads/master) push_main=1; full=1;;
+  esac
+  [ "$remote_sha" = "$zero" ] && full=1
+done
+
+if [ "$refs_need_gate" = "0" ]; then
+  echo "pre-push: 只推 tag（发布动作），跳过门禁 —— release.mjs 已经跑过 check / test / pack" >&2
+  exit 0
+fi
+
+root=$(git rev-parse --show-toplevel) || exit 1
+cd "$root" || exit 1
+
+run_step() {
+  label="$1"; shift
+  echo "pre-push: $label" >&2
+  if ! out=$("$@" 2>&1); then
+    printf '%s\n' "$out" | tail -40 >&2
+    echo "pre-push: $label 没过，已阻止推送（跳过本次：PLUGIN_SKIP_HOOK=1 git push）" >&2
+    exit 1
+  fi
+}
+
+echo "pre-push: [快档]" >&2
+# 模板自己用 --template（严格模式），派生项目用普通模式 —— 与 ci.yml 里的判断保持一致。
+if node -e "process.exit(require('./package.json').scripts?.['check:template'] ? 0 : 1)" 2>/dev/null; then
+  run_step "check:template" node scripts/check.mjs --template
+else
+  run_step "check" node scripts/check.mjs
+fi
+run_step "privacy-scan" node scripts/privacy-scan.mjs
+
+if [ "$full" = "1" ]; then
+  run_step "[全档] npm test" npm test --silent
+  run_step "[全档] check-docs" node scripts/check-docs.mjs
+  run_step "[全档] npm pack --dry-run" npm pack --dry-run
+  echo "pre-push: 快档+全档全绿，放行" >&2
+else
+  echo "pre-push: 快档绿；本次不是合入点，跳过 test/docs/pack（要跑：PLUGIN_FULL=1 git push）" >&2
+fi
+exit 0

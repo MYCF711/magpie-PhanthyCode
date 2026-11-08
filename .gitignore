@@ -1,0 +1,19 @@
+node_modules/
+*.tgz
+*.log
+.DS_Store
+_*.mjs
+magpie-plugin-contract-full.txt
+
+# 联调产物（含上游真实业务数据：accountScope / installationId / token 指纹 / 409 body）
+# 这些文件只在本机临时存在，既不进仓库也不进包（AGENTS 坑 29）
+verify*.json
+oauth-out.txt
+oauth-err.txt
+
+# 会话棋谱（本地参考，体积大，不进包也不进仓库）
+kifu/
+
+# 测量脚本的串行锁（运行时产物，不入库）
+.probe-lock
+

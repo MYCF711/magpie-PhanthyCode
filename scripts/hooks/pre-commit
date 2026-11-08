@@ -1,0 +1,7 @@
+#!/bin/sh
+# magpie 插件模板 · 提交前脱敏。
+# 由 scripts/install-hooks.mjs 安装；改规则请改 scripts/privacy-scan.mjs，别改 .git/hooks 里的副本。
+#
+# 只扫暂存区（--staged）：毫秒级，防的就是「秘密被提交进历史」这一件事。
+# 全量扫描（已跟踪 + 未跟踪）由 pre-push 和 CI 负责。
+exec node scripts/privacy-scan.mjs --staged

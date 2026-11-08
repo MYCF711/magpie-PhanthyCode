@@ -1,0 +1,46 @@
+name: magpie plugin check
+description: Run this plugin's rule check (scripts/check.mjs) against a provider plugin in the workspace. Exit code 0 = compliant.
+author: phanthywork-auth
+
+# 用法（在同一个仓库里）：
+#
+#   - uses: actions/checkout@v4
+#   - uses: ./.github/actions/check
+#     with:
+#       target: .
+#
+# 复合动作直接跑本仓库的 scripts/check.mjs，不下载 npm 包、不装依赖，
+# 也不需要被检查的仓库先克隆模板。它只读目标目录，不写任何文件。
+# 派生项目用默认的 template: false —— 显示名/provider name 还是「未命名」占位符就失败。
+# 只有脚手架自身（CI 自测）才传 template: true。
+
+inputs:
+  target:
+    description: "被检查的插件目录，相对工作区的路径"
+    required: false
+    default: "."
+  node-version:
+    description: "Node 版本；检查脚本只用 node: 内置模块，22 或 24 都可"
+    required: false
+    default: "22"
+  template:
+    description: "仅脚手架自身用；true 时允许「未命名」占位符"
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v7
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: magpie plugin check
+      shell: bash
+      working-directory: ${{ inputs.target }}
+      run: |
+        if [ "${{ inputs.template }}" = "true" ]; then
+          node "$GITHUB_ACTION_PATH/../../../scripts/check.mjs" --template .
+        else
+          node "$GITHUB_ACTION_PATH/../../../scripts/check.mjs" .
+        fi
