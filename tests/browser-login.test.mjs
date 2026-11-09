@@ -113,15 +113,22 @@ test("findBrowser 静态全部没命中才回退注册表（注册表路径仍�
   assert.ok(lookups > 0, "静态没命中时必须能回退到注册表")
 })
 
-test("默认 findBrowser() 记忆化：一次进程只发现一次；resetBrowserCache 可重置", () => {
+test("默认 findBrowser() 记忆化：命中才缓存；没命中不写缓存（装完浏览器即生效）", () => {
   resetBrowserCache()
   assert.equal(_internal.hasDefaultBrowserCache(), false, "reset 后应为空")
 
+  // 机器上有没有浏览器取决于跑测环境（CI 的 ubuntu 上没有），两条分支都要成立。
   const first = findBrowser()
-  assert.equal(_internal.hasDefaultBrowserCache(), true, "默认调用后应写入缓存")
-  const second = findBrowser()
-  // 引用相等即可证明走了缓存（没命中时两者都是 null，同样成立）
-  assert.equal(second, first, "第二次默认调用必须复用第一次的发现结果")
+  if (first) {
+    assert.equal(_internal.hasDefaultBrowserCache(), true, "命中后应写入缓存")
+    assert.equal(findBrowser(), first, "第二次默认调用必须复用第一次的发现结果")
+  } else {
+    assert.equal(
+      _internal.hasDefaultBrowserCache(),
+      false,
+      "找不到时不许缓存 null —— 用户装完浏览器必须立刻生效，否则要重启 magpie",
+    )
+  }
 
   resetBrowserCache()
   assert.equal(_internal.hasDefaultBrowserCache(), false, "resetBrowserCache 必须真的清空")
