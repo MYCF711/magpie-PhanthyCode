@@ -21,6 +21,7 @@
 //   卡片显示名交给宿主回退成供应商名 —— 不要拿内部 id 冒充账号名。
 
 import { BASE } from "./context.mjs"
+import { trustedUrlOf } from "./origin.mjs"
 
 /** 公开的 OAuth 客户端 id（桌面端也用同一个） */
 export const CLIENT_ID = "phanthy-code-cli"
@@ -88,7 +89,7 @@ export function buildAuthorizeUrl({ base = BASE, redirectUri, state, codeChallen
   requiredString(state, "buildAuthorizeUrl: state")
   requiredString(codeChallenge, "buildAuthorizeUrl: codeChallenge")
 
-  const url = new URL(`${trimmedBase(base)}${AUTHORIZE_PATH}`)
+  const url = trustedUrlOf(AUTHORIZE_PATH, { base: trimmedBase(base) })
   url.searchParams.set("response_type", "code")
   url.searchParams.set("client_id", CLIENT_ID)
   url.searchParams.set("redirect_uri", redirectUri)
@@ -164,7 +165,9 @@ export async function requestToken({
   if (typeof fetchImpl !== "function") throw new TypeError("requestToken: fetchImpl 必须是函数")
   if (!(form instanceof URLSearchParams)) throw new TypeError("requestToken: form 必须是 URLSearchParams")
 
-  const url = `${trimmedBase(base)}${TOKEN_PATH}`
+  // ⚠ 换票请求体里带 authorization_code / refresh_token：URL 必须过 origin 闸门
+  //   （https + 无 userinfo + 与 BASE 同 origin），不能拿字符串直接拼。
+  const url = trustedUrlOf(TOKEN_PATH, { base: trimmedBase(base) }).toString()
   const timeout = AbortSignal.timeout(timeoutMs)
   const res = await fetchImpl(url, {
     method: "POST",

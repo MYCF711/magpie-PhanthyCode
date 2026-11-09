@@ -98,6 +98,20 @@ import { createUsageCache } from "./src/usage-cache.mjs"
 const ANTHROPIC_VERSION = "2023-06-01"
 
 /**
+ * 两种登录提示语。
+ *
+ * ⚠ 「开了隔离窗口」只是**尽力而为**，不是登录的前提：没有 Chromium（macOS 只有 Safari、
+ *   Linux 只有 Firefox、无 GUI 的机器）、启动报错、或者单实例浏览器把参数转交给了已运行
+ *   的实例，都仍然要能把 `url` 交回宿主、由系统默认浏览器打开 —— 否则这类用户从 0.1.x
+ *   升级上来就**彻底没有 OAuth 入口**了（只剩「从本机导入」，而它要求装过官方桌面端）。
+ */
+const ISOLATED_LOGIN_NOTE =
+  "已打开独立登录窗口（不带你日常浏览器的 Cookie 或旧账号会话）。请在里面完成 Phanthy 登录，完成后窗口会自动关闭。"
+const FALLBACK_LOGIN_NOTE =
+  "没能打开独立登录窗口（没找到 Chromium / 启动失败 / 被已有的浏览器实例接管），已改用你的默认浏览器打开授权页。"
+
+
+/**
  * 宿主透传下来的、必须在重建 headers 时丢掉的项。
  *
  * `content-length` / `transfer-encoding` / `connection` 是 hop-by-hop 头（PROTOCOL-INFERENCE.md
@@ -206,6 +220,8 @@ export const PhanthyCodeAuthPlugin = async (_ctx = {}, _options = {}) => {
             const state = randomState()
             const pkce = generatePkce()
             const listener = await startLoopback({ state, path: CALLBACK_PATH })
+            /** 隔离窗口句柄；`ok:false` 表示「没开成」，不是「不能登录」。 */
+            let launch = null
             // ⚠ listener 一旦起来，这一整段都必须保证「异常也要关掉它」（L-2）：
             //   漏关的 loopback Server 会把端口占住、把进程吊到 300s 超时
             //   （review 实测 [still running after 120000ms]），用户点一次「+」就多一个。
@@ -216,30 +232,32 @@ export const PhanthyCodeAuthPlugin = async (_ctx = {}, _options = {}) => {
                 state,
                 codeChallenge: pkce.challenge,
               })
-              // 每次加号都开一份全新的临时 profile，避免日常浏览器里的旧 Phanthy
+              // 每次加号都**尝试**开一份全新的临时 profile，避免日常浏览器里的旧 Phanthy
               // 会话让授权页直接跳过登录。这里只等进程起来，不等用户登录。
-              const launch = await openIsolatedLogin({ url })
-              if (!launch?.ok) {
-                try {
-                  listener.close()
-                } catch {}
-                return {
-                  type: "failed",
-                  error: `无法打开隔离登录浏览器：${launch?.error ?? "未知启动错误"}`,
-                }
+              //
+              // ⚠ 但它是**尽力而为**：没有 Chromium / 启动报错 / 单实例浏览器接管参数时，
+              //   必须退回 0.1.x 的行为 —— 把 `url` 交回宿主、由系统默认浏览器打开
+              //   （`opened: false`）。否则这些用户升级后彻底没有 OAuth 入口。
+              try {
+                launch = await openIsolatedLogin({ url })
+              } catch (launchError) {
+                launch = { ok: false, error: String(launchError?.message ?? launchError) }
               }
-              // 用户没完成登录就关窗时，让 listener.wait 立刻失败，不必等超时。
-              launch.child?.once?.("exit", () => {
-                try {
-                  listener.close()
-                } catch {}
-              })
+              const isolated = Boolean(launch?.ok)
+              if (isolated) {
+                // 用户没完成登录就关窗时，让 listener.wait 立刻失败，不必等超时。
+                launch.child?.once?.("exit", () => {
+                  try {
+                    listener.close()
+                  } catch {}
+                })
+              }
 
               return {
                 url,
-                instructions: "已打开独立登录窗口（不带你日常浏览器的 Cookie 或旧账号会话）。请在里面完成 Phanthy 登录，完成后窗口会自动关闭。",
+                instructions: isolated ? ISOLATED_LOGIN_NOTE : FALLBACK_LOGIN_NOTE,
                 method: "auto",
-                opened: true,
+                opened: isolated,
 
                 async callback(code) {
                   try {
@@ -298,7 +316,7 @@ export const PhanthyCodeAuthPlugin = async (_ctx = {}, _options = {}) => {
                     return { type: "failed", error: String(error?.message ?? error) }
                   } finally {
                     try {
-                      await launch.close()
+                      await launch?.close?.()
                     } catch {}
                     try {
                       listener.close()
@@ -307,15 +325,17 @@ export const PhanthyCodeAuthPlugin = async (_ctx = {}, _options = {}) => {
                 },
               }
             } catch (error) {
-              // ⚠ L-2：buildAuthorizeUrl / openIsolatedLogin **抛异常**时，
-              //   上面的 `ok:false` 分支根本没机会执行 —— 必须在这里关掉 loopback，
-              //   否则端口泄漏到 300s 超时，进程也退不出去。
+              // ⚠ L-2：buildAuthorizeUrl 抛异常时 listener 已经起来了 ——
+              //   必须在这里关掉，否则端口泄漏到 300s 超时，进程也退不出去。
               try {
                 listener.close()
               } catch {}
+              try {
+                await launch?.close?.()
+              } catch {}
               return {
                 type: "failed",
-                error: `无法打开隔离登录浏览器：${String(error?.message ?? error)}`,
+                error: `无法准备登录：${String(error?.message ?? error)}`,
               }
             }
           },

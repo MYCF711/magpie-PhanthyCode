@@ -89,9 +89,10 @@ function fakeSpawn({ mode = "spawn", throwError = null, exitOnKill = true } = {}
   return { spawn, calls }
 }
 
-function fakeFs({ firstDir = null } = {}) {
+function fakeFs({ firstDir = null, profileExists = true, removeFails = 0 } = {}) {
   const mkdtempCalls = []
   const removeCalls = []
+  let failsLeft = removeFails
   let n = 0
   const mkdtemp = (prefix) => {
     mkdtempCalls.push(prefix)
@@ -101,8 +102,14 @@ function fakeFs({ firstDir = null } = {}) {
   }
   const removeDir = (dir) => {
     removeCalls.push(dir)
+    if (failsLeft > 0) {
+      failsLeft -= 1
+      throw new Error("EBUSY: resource busy or locked")
+    }
   }
-  return { mkdtemp, removeDir, mkdtempCalls, removeCalls }
+  // 「这次新建的 profile 真的被浏览器用上了吗」的判据是目录里的 `Local State`。
+  const exists = () => profileExists
+  return { mkdtemp, removeDir, exists, mkdtempCalls, removeCalls }
 }
 
 function launchWith({ fs = fakeFs(), sp = fakeSpawn(), ...options } = {}) {
@@ -114,6 +121,7 @@ function launchWith({ fs = fakeFs(), sp = fakeSpawn(), ...options } = {}) {
     spawn: sp.spawn,
     mkdtemp: fs.mkdtemp,
     removeDir: fs.removeDir,
+    exists: fs.exists,
     ...options,
   })
 }
@@ -277,6 +285,33 @@ test("关窗时进程赖着不走：有界等待后补 SIGKILL，并清掉目录
 
 // ── 失败 / 超时 / 取消 ────────────────────────────────────────────────
 
+test("启动后校验：profile 没被用上（单实例浏览器转交参数）→ 按启动失败收掉，不谎报隔离", async () => {
+  const fs = fakeFs({ profileExists: false })
+  const sp = fakeSpawn()
+  const baseline = _internal.activeTimers()
+  const h = await launchWith({ fs, sp, profileReadyMs: 60 })
+
+  assert.equal(h.ok, false, "进程起来过，但这不等于 profile 被用上了")
+  assert.match(h.error, /没有使用本次的临时 profile/)
+  assert.equal(sp.calls[0].child.killCount, 1, "转交后残留的进程要收掉")
+  assert.deepEqual(fs.removeCalls, [h.userDataDir], "转交用的临时目录也要清")
+  assert.equal(_internal.activeTimers(), baseline, "轮询定时器不许留下")
+})
+
+test("目录删不掉时不谎报 removedDir：再 close 会重试，成功后才算删掉", async () => {
+  const fs = fakeFs({ removeFails: 2 })
+  const sp = fakeSpawn({ exitOnKill: false })
+  const h = await launchWith({ fs, sp, closeTimeoutMs: 20 })
+
+  const first = await h.close()
+  assert.equal(first.removedDir, false, "两次都失败 ⇒ 必须如实回 false（目录里是一份已登录会话）")
+  assert.equal(fs.removeCalls.length, 2, "第一次 close 内会重试一次")
+
+  const second = await h.close()
+  assert.equal(second.removedDir, true, "再 close 必须还能补删")
+  assert.equal(fs.removeCalls.length, 3)
+})
+
 test("spawn 报错（ENOENT）：清理临时目录、不留定时器、失败句柄的 close 仍然安全", async () => {
   const fs = fakeFs()
   const sp = fakeSpawn({ mode: "error" })
@@ -372,6 +407,7 @@ test("未显式给 browser 时用注入的 findBrowser 发现路径（复用 bro
     spawn: sp.spawn,
     mkdtemp: fs.mkdtemp,
     removeDir: fs.removeDir,
+    exists: fs.exists,
   })
   assert.equal(h.ok, true)
   assert.equal(sp.calls[0].command, BROWSER.path)
@@ -443,7 +479,7 @@ function loopbackServers() {
   })
 }
 
-test("authorize：openIsolatedLogin 抛异常 → 返回 failed 且关掉 loopback（不留 Server）", async () => {
+test("authorize：openIsolatedLogin 抛异常 → 退回默认浏览器（opened:false），callback 收尾关掉 loopback", async () => {
   const home = mkdtempSync(join(tmpdir(), "pw-l2-"))
   const previous = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE }
   process.env.HOME = home
@@ -467,8 +503,15 @@ test("authorize：openIsolatedLogin 抛异常 → 返回 failed 且关掉 loopba
 
     const result = await method.authorize()
 
-    assert.equal(result.type, "failed", "异常必须变成可行动的 failed，而不是把异常抛给宿主")
-    assert.match(result.error, /boom-browser/)
+    // 启动环节抛异常 ≠ 不能登录：必须退回 0.1.x 的行为，把授权地址交回宿主。
+    assert.equal(result.type, undefined, "异常不该被吞成「登录失败」")
+    assert.match(result.url, /\/oauth\/authorize\?/, "必须交回可打开的授权地址")
+    assert.equal(result.opened, false, "没开成隔离窗口 ⇒ 让宿主自己打开")
+    assert.equal(typeof result.callback, "function")
+
+    // 收尾：喂一个坏 code 走完 callback，finally 必须关掉 loopback。
+    const failed = await result.callback("bad-code")
+    assert.equal(failed.type, "failed")
 
     // close 之后端口释放是异步的：给一个 tick 再断言。
     await new Promise((resolve) => setTimeout(resolve, 50))

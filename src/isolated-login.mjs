@@ -20,7 +20,7 @@
 //     复核一遍；万一指向日常 profile，直接拒绝启动，并且**绝不删除**那个目录。
 
 import { spawn as nodeSpawn } from "node:child_process"
-import { mkdtempSync, rmSync } from "node:fs"
+import { existsSync, mkdtempSync, rmSync } from "node:fs"
 import { tmpdir as osTmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -30,6 +30,10 @@ import { findBrowser } from "./browser-login.mjs"
 const TEMP_PREFIX = "phanthy-isolated-login-"
 const STARTUP_TIMEOUT_MS = 5_000
 const CLOSE_TIMEOUT_MS = 3_000
+// 启动后等「这份 profile 真的被用上了」的上限：Chromium 建 `Local State` 是毫秒级，
+// 等不到就说明参数被别的实例接管了（单实例国产浏览器最常见）。
+const PROFILE_READY_MS = 3_000
+const PROFILE_POLL_MS = 50
 
 // Chromium 的「干净启动」开关。少一个都可能弹首启/推荐页，或让扩展把会话带进来。
 const REQUIRED_FLAGS = [
@@ -56,13 +60,19 @@ const DAILY_PROFILE_PATTERNS = [
 // 本模块自己开的定时器（供测试断言「没有长驻定时器」）。
 const liveTimers = new Set()
 
-function startTimer(fn, ms) {
+function startTimer(fn, ms, { ref = true } = {}) {
   const id = setTimeout(() => {
     liveTimers.delete(id)
     fn()
   }, ms)
-  // 即使漏清也不会吊住进程退出；但仍以「清零」为准（测试会查 liveTimers）。
-  id.unref?.()
+  // ⚠ 默认必须**保持引用**（ref）：本模块的定时器都是「有界等待」的那个句柄 ——
+  //   `waitExit()` / 启动超时都是 `await Promise.race([promise, 这个定时器])`。
+  //   一旦 unref，事件循环里没有别的句柄时会先结束，await 变成永远不落地的
+  //   Promise（Linux CI 实测：`Promise resolution is still pending but the event
+  //   loop has already resolved`，同文件后续用例全被 cancelledByParent 掐掉）。
+  //   泄漏靠 `stopTimer()` 在 finally 里清零，而不是靠 unref。
+  if (ref) id.ref?.()
+  else id.unref?.()
   liveTimers.add(id)
   return id
 }
@@ -150,11 +160,17 @@ export async function launchIsolatedLogin(options = {}) {
     findBrowser: discoverBrowser = findBrowser,
     spawn: spawnImpl = nodeSpawn,
     mkdtemp: mkdtempImpl = mkdtempSync,
-    removeDir = (dir) => rmSync(dir, { recursive: true, force: true }),
+    removeDir = (dir) => rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }),
     tmpdir = osTmpdir(),
     env = process.env,
     startupTimeoutMs = STARTUP_TIMEOUT_MS,
     closeTimeoutMs = CLOSE_TIMEOUT_MS,
+    // 启动后校验「这次真的用了我们新建的 profile」。测试可以注入片假件，生产必须开：
+    // 单实例浏览器（360 / QQ / 搜狗…）会把参数转交给已运行的实例，此时进程会立刻退出、
+    // 授权页仍然是日常会话 —— 不校验就等于什么都没隔离。
+    verifyProfile = true,
+    exists = existsSync,
+    profileReadyMs = PROFILE_READY_MS,
     signal,
   } = options
 
@@ -192,14 +208,18 @@ export async function launchIsolatedLogin(options = {}) {
   }
 
   function removeTempDir() {
-    if (dirRemoved || dirKept) return
-    if (typeof state.userDataDir !== "string" || state.userDataDir === "") return
-    dirRemoved = true
+    if (dirRemoved || dirKept) return dirRemoved
+    if (typeof state.userDataDir !== "string" || state.userDataDir === "") return false
     try {
       removeDir(state.userDataDir)
     } catch {
-      // 清理失败不阻塞登录流程：目录留在 tmp 下也不会污染日常 profile
+      // ⚠ 删不掉（Windows 上刚 kill 浏览器最常见 EBUSY）**绝不能谎报成功**：
+      //   登录成功后的 profile 里是一份已登录会话，留在 %TEMP% 就是一份可用的 Cookie。
+      //   保持 dirRemoved=false，close() 还会再试一次；`rmSync` 自身也带 maxRetries。
+      return false
     }
+    dirRemoved = true
+    return true
   }
 
   function onExit() {
@@ -258,9 +278,48 @@ export async function launchIsolatedLogin(options = {}) {
     }
   }
 
+  /** 有界等待（定时器同样清零，不留常驻句柄）。 */
+  async function sleep(ms) {
+    await new Promise((resolve) => {
+      startTimer(resolve, ms)
+    })
+  }
+
+  /**
+   * 这次新建的 profile 真的被浏览器用上了吗？
+   *
+   * Chromium 启动后会立刻在自己的 `user-data-dir` 下写 `Local State`。单实例国产浏览器
+   * （360 / QQ / 搜狗…）会把命令行参数转交给**已经运行的实例**然后自己退出 ——
+   * 此时进程「起来过」，但授权页用的是用户日常的会话，正是这套机制要修的那个 bug。
+   * 等不到文件就当成启动失败，让调用方退回默认浏览器。
+   */
+  async function waitForProfile() {
+    if (!verifyProfile) return true
+    const marker = join(String(state.userDataDir ?? ""), "Local State")
+    const deadline = Date.now() + profileReadyMs
+    for (;;) {
+      try {
+        if (exists(marker)) return true
+      } catch {}
+      if (state.exited) return false
+      const left = deadline - Date.now()
+      if (left <= 0) return false
+      await sleep(Math.min(PROFILE_POLL_MS, left))
+    }
+  }
+
   /** 关闭本次启动的浏览器并删除本次的临时目录。幂等：重复调用只清一次。 */
   async function close() {
-    if (state.closed) return closeResult
+    if (state.closed) {
+      // ⚠ 上一次删目录失败时（Windows EBUSY 很常见），再 close 必须**还能重试** ——
+      //   否则「关窗即删」就成了空话：目录里躺着一份已登录会话，而这句承诺永远不兑现。
+      //   成功过就不会再删（幂等），失败过才重试。
+      if (!dirRemoved && !dirKept) {
+        removeTempDir()
+        closeResult.removedDir = dirRemoved
+      }
+      return closeResult
+    }
     state.closed = true
     stopTimer(startupTimer)
     startupTimer = null
@@ -286,6 +345,9 @@ export async function launchIsolatedLogin(options = {}) {
       }
     }
     removeTempDir()
+    // Windows 上子进程退出与文件句柄释放之间有间隙：再给一次机会。
+    // 仍然失败就如实回 `removedDir: false`（默认 removeDir 自己带 maxRetries）。
+    if (!dirRemoved) removeTempDir()
     try {
       child?.removeListener?.("exit", onExit)
     } catch {}
@@ -409,6 +471,22 @@ export async function launchIsolatedLogin(options = {}) {
     if (!state.error) state.error = started.error ?? "启动浏览器失败"
     return handle
   }
+
+  // ⚠ 进程「起来过」不等于「这份 profile 被用上了」：单实例浏览器会转交参数后立刻退出，
+  //   此时授权页仍是日常会话。校验不过就按启动失败处理，让调用方退回默认浏览器。
+  if (!(await waitForProfile())) {
+    const message = "浏览器没有使用本次的临时 profile（很可能把参数转交给了已运行的实例）"
+    state.ok = false
+    state.error = message
+    try {
+      child.kill()
+    } catch {}
+    removeTempDir()
+    if (typeof signal?.removeEventListener === "function") {
+      signal.removeEventListener("abort", onAbort)
+    }
+    return handle
+  }
   return handle
 }
 
@@ -417,6 +495,8 @@ export const _internal = {
   REQUIRED_FLAGS,
   STARTUP_TIMEOUT_MS,
   CLOSE_TIMEOUT_MS,
+  PROFILE_READY_MS,
+  PROFILE_POLL_MS,
   DAILY_PROFILE_PATTERNS,
   activeTimers: () => liveTimers.size,
   isDailyProfilePath,

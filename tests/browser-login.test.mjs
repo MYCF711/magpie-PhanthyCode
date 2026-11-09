@@ -51,7 +51,10 @@ test("findBrowser 只返回真实存在的候选；找不到返回 null", () => 
 
 test("registryAppPath：reg 的 stderr 丢弃、不弹窗、带上限时；命中路径原样返回", () => {
   const calls = []
-  const exePath = join("C:\\fake", "bin", "msedge.exe")
+  // ⚠ 必须写**字面量** Windows 路径，不能用 `join`：注册表返回的是反斜杠，
+  //   而 Linux CI 上 `join` 产出的是正斜杠（`C:\fake/bin/msedge.exe`），
+  //   两边永远不相等 ⇒ `exists()` 不命中 ⇒ 函数回空串，测试在 ubuntu 上必红。
+  const exePath = "C:\\fake\\bin\\msedge.exe"
   // reg query 的真实输出形状（含中文错误以外的正常行）
   const exec = (command, args, options) => {
     calls.push({ command, args, options })
