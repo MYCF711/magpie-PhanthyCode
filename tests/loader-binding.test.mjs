@@ -135,10 +135,55 @@ test("第二次调用：熔断生效，零请求直接抛同一条错误", async
 })
 
 test("数据面不受影响：模型目录照常可用", async () => {
+  // 目录行必须带合法价格：单条缺价按三态契约**不列**（`src/catalog.mjs` 的 `creditsOf`），
+  // 所以夹具里显式写厂商真实标价（phanthy-fast = 0 积分）。
   const { fetchImpl } = recorder({
-    "/api/phanthy_code/models": { status: 200, body: { schema_version: 1, default_model: "phanthy-fast", models: [{ id: "phanthy-fast", label: "Phanthy Fast" }] } },
+    "/api/phanthy_code/models": {
+      status: 200,
+      body: {
+        schema_version: 1,
+        default_model: "phanthy-fast",
+        models: [
+          {
+            id: "phanthy-fast",
+            label: "Phanthy Fast",
+            pricing: { input_credits_per_million_tokens: 0, output_credits_per_million_tokens: 0 },
+          },
+        ],
+      },
+    },
   })
   const plugin = await PhanthyCodeAuthPlugin({}, { fetch: fetchImpl })
   const models = await plugin.provider.models({}, { auth: { ...AUTH, uid: "acct-data" } })
   assert.deepEqual(Object.keys(models), ["phanthy-fast"])
+})
+
+test("loader.fetch：非可信 origin 在读新登录态/私钥前拒绝，零出站", async () => {
+  let authCalls = 0
+  let upstreamCalls = 0
+  const plugin = await PhanthyCodeAuthPlugin({}, {
+    fetch: async () => {
+      upstreamCalls += 1
+      throw new Error("非可信 URL 不应到达 fetch")
+    },
+  })
+  const loader = await plugin.auth.loader(async () => {
+    authCalls += 1
+    return { ...AUTH, uid: "acct-untrusted" }
+  }, { id: "phanthycode" })
+  assert.equal(authCalls, 1, "loader 初始化只读一次登录态")
+
+  const inputs = [
+    "https://code.phanthy.com.evil.test/v1/messages",
+    new URL("https://evil.test/v1/messages"),
+    new Request("http://code.phanthy.com/v1/messages", { method: "POST", body: "{}" }),
+  ]
+  for (const input of inputs) {
+    await assert.rejects(
+      () => loader.fetch(input, { method: "POST", body: "{}" }),
+      (error) => error?.status === 400 && error?.code === "invalid_request" && !error?.signIn,
+    )
+  }
+  assert.equal(authCalls, 1, "被拒绝的 URL 不得再次读取登录态")
+  assert.equal(upstreamCalls, 0, "被拒绝的 URL 不得发起任何请求")
 })

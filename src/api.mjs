@@ -17,8 +17,8 @@
 //   429              → 限流，可退避重试
 //   5xx              → 上游抖动，可重试
 
-import { BASE } from "./context.mjs"
 import { CODE_VALUES, CODES, OFFICIAL_CLIENT_SOURCE, OFFICIAL_UA, isLoginBroken } from "./http.mjs"
+import { trustedUrlOf } from "./origin.mjs"
 
 /** 云端给的业务错误。带上 status 与 code，调用方才能分流。 */
 export class ApiError extends Error {
@@ -65,6 +65,15 @@ export function headersFor(auth = {}, extra = {}) {
  */
 export async function read(res, url = "") {
   const text = await res.text()
+  // `redirect:"manual"` 把 3xx 留给这里。必须在 JSON.parse **之前**截住：
+  // 真实重定向页通常是 HTML，先解析会落成「status=302 + code 为空」的另一种错误。
+  // 统一映射为 502 + upstream_unavailable；既不自动跟随，也不采信 3xx 正文里的
+  // `model_not_found` 等词表内 code（它不属于这次重定向的真实语义）。
+  if (res.status >= 300 && res.status < 400) {
+    const message = `上游返回 HTTP ${res.status} 重定向，已拒绝自动跟随`
+    const body = { error: { code: CODES.upstreamUnavailable, message } }
+    throw new ApiError(message, { status: 502, code: CODES.upstreamUnavailable, url, body })
+  }
   let body
   try {
     body = text ? JSON.parse(text) : {}
@@ -133,12 +142,18 @@ export function errorCodeFor(status, body) {
 
 /** 带超时的 fetch + 统一读法。数据类请求都走它。 */
 export async function get(path, auth, { timeout = TIMEOUT.short, method = "GET", body, headers, fetchImpl = globalThis.fetch, signal } = {}) {
-  const url = path.startsWith("http") ? path : `${BASE}${path}`
+  // 出口守卫：绝对 URL 必须是 BASE 的 https origin；相对路径拼好后同样再验一遍
+  // （见 `src/origin.mjs`）。这个函数会把 `Authorization: Bearer` 一起发出去，
+  // 所以「发到哪台主机」必须在发请求之前定死。
+  const url = trustedUrlOf(path).href
   const timeoutSignal = AbortSignal.timeout(timeout)
   const res = await fetchImpl(url, {
     method,
     headers: headersFor(auth, headers),
     body: body === undefined ? undefined : JSON.stringify(body),
+    // ⚠ L-5：**不许自动跟随 3xx**。跨站 302 时 undici 会剥掉 `authorization`，
+    //   但**会转发** `x-desktop-*` 签名头 / 指纹头 —— 不跟就是最省事的防线。
+    redirect: "manual",
     signal: signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal,
   })
   return read(res, url)

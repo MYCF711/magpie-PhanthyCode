@@ -75,3 +75,47 @@ export function uidOf(auth, record) {
   const raw = refresh || rawCredentialOf(auth)
   return String(record?.userId || metadataOf(auth).userId || auth?.uid || (raw ? fingerprint(raw) : ""))
 }
+
+/**
+ * 生成「稳定身份」的 metadata。
+ *
+ * 为什么必须有它：magpie 对 **`type: "api"`** 的登录态只持久化
+ * `{ type, key, metadata }`（2026-11-09 实测）—— 顶层的 `uid` / `accountScope` /
+ * `expires` 全部丢掉。而 `uidOf()` 本来就把 `metadata.userId` 排在 `auth.uid` 之前，
+ * 所以「同账号换 token 不换设备」唯一可靠的落点就是这里。
+ *
+ * 合并而不是替换：`refresh` 的返回值会被宿主**合并**进旧记录，只给 `{ email }`
+ * 会把 `metadata.userId` / `metadata.accountScope` 冲掉（那就又退回凭据指纹了）。
+ *
+ * @param {{metadata?: *}} [auth] 旧登录态（续期时传入；登录时传 undefined）
+ * @param {{accountId?: string, uid?: string, accountScope?: string}} [patch]
+ * @returns {Record<string, *>} 合并后的 metadata
+ */
+export function metadataWithIdentity(auth, { accountId = "", uid = "", accountScope = "" } = {}) {
+  const next = { ...metadataOf(auth) }
+  const name = String(accountId ?? "").trim()
+  const id = String(uid ?? "").trim()
+  const scope = String(accountScope ?? "").trim()
+  if (name) next.email = name
+  if (id) next.userId = id
+  if (scope) next.accountScope = scope
+  return next
+}
+
+/**
+ * 稳定作用域：`auth.accountScope` → `metadata.accountScope` → 安装记录里的值。
+ *
+ * 三种登录态都要认：oauth 型留顶层，api 型只剩 metadata，旧记录只在安装记录里。
+ * **不跨账号回退**：拿不到就返回空串，调用方去问 profile 或按「没有」处理。
+ *
+ * @param {*} auth magpie 的 auth 对象
+ * @param {{accountScope?: *}} [record] 安装记录
+ * @returns {string} 空串 = 未知
+ */
+export function accountScopeOf(auth, record) {
+  for (const candidate of [auth?.accountScope, metadataOf(auth).accountScope, record?.accountScope]) {
+    const value = String(candidate ?? "").trim()
+    if (value) return value
+  }
+  return ""
+}

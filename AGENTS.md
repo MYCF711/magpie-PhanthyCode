@@ -36,7 +36,7 @@ PR 是 GitHub 对受保护分支的技术要求（直推报 `GH006`），批准�
 | # | 症状（出问题时你看到什么） | 判据 | 出处 |
 |---|---|---|---|
 | 1 | 额度条永远是 100%；空账号反而排到队首 | `usage.used` **必填**且是有限数字 —— 它也是路由排序输入，漏了按 0% 算 | HOOKS 九 |
-| 2 | 免费模型被反复派发；或收费模型被标成免费 | `free` 只认厂商自己的声明：列表价 $0，或厂商自己的计费端点明确说 0。**`rate: 0` 的意思是「没给倍率」，不是免费** —— magpie 不会从 `rate` 推 `free`（#468 更正，2026-10-29）。反过来，把「套餐内不按次计费但吃额度」的模型标成 `free: true`，Free first 会一直派发它们 | HOOKS 十一之二 |
+| 2 | 免费模型被反复派发；或收费模型被标成免费 | `free` 只认厂商自己的声明：列表价 $0，或厂商自己的计费端点明确说 0。**`rate: 0` 的意思是「没给倍率」，不是免费** —— magpie 不会从 `rate` 推 `free`（#468 更正，2026-10-29）。**价格是三态，不是两态**：缺价格 / `null` / 空对象 / `""` / 非法字符串 / 布尔 / 负数 → **不列这一条**（`Number(x) \|\| 0` 就是把「不知道」写成「免费」）；只有**显式 `0`** 才 `free: true`。反过来，把「套餐内不按次计费但吃额度」的模型标成 `free: true`，Free first 会一直派发它们。判据：`node --test tests/catalog.test.mjs` 退出 0 | HOOKS 十一之二 · `src/catalog.mjs` 的 `creditsOf` · `src/models.mjs` 的 `priceOf` |
 | 3 | 点登录后界面转圈很久，或模型列表整个卡住 | `authorize()` 必须**立刻**返回；网络请求一律挪到 `loader` | `index.mjs` 顶部「三条铁律」第 2 条 |
 | 4 | 刷新一次 token 后某个字段变空，或用户被要求重登 | `refresh` 返回的是**合并**结果，只给新字段会覆盖掉旧的 | `index.mjs` 顶部「三条铁律」第 3 条 |
 | 5 | 插件装上了，但模型列表空、界面没反应 | `config.models` 必须有内容（可以是静态占位） | `index.mjs` 顶部「三条铁律」第 1 条 |
@@ -61,11 +61,11 @@ PR 是 GitHub 对受保护分支的技术要求（直推报 `GH006`），批准�
 
 | # | 症状 | 判据 | 出处 |
 |---|---|---|---|
-| 16 | 加了第二个账号，第一个账号的数据变了 / 串号 | 一切按账号落盘的东西，文件名必须带账号（`<plugin>-<siteId>__<account>.json`）；**不要用模块级变量存 per-account 状态** —— 宿主是同一个进程跑所有账号 | [`src/hooks/models.mjs`](HOOKS.md) 的 `inScope` |
-| 17 | 接口抖一下，列表整个空掉；或某个模型缺价格，用户选了报错 | **部分成功有三态**，方向要各自选对：① 整个接口失败 → 退回上次快照（不要返回空表）② 接口成功但单条缺字段 → **不列**（不猜）③ 登录失效 → 抛 `signIn: "expired"` | [`src/models.mjs`](./src/models.mjs) 的 `buildModels` |
-| 18 | 越改越乱，`index.mjs` 涨到几百行，改一个钩子要读全篇 | 成熟形态是**`index.mjs` 只做九项钩子的装配，实现全在 `src/`**。实测四个真实插件的 `index.mjs` 是 80~715 行，而 `src/` 是 1.4k~3.7k 行 —— **本仓库同样是这个形态：`index.mjs` 只做九项装配（额度卡片已搬进 `src/usage-windows.mjs`），实现全在 `src/` 的 39 个模块里**。行数每天在动（改一行注释就变），这里不抄 —— 要比较就自己 `wc -l` | 本文件「五、长大之后」 |
+| 16 | 加了第二个账号，第一个账号的数据变了 / 串号 | 一切按账号落盘的东西，文件名必须带账号（`<plugin>-<siteId>__<account>.json`）；**不要用模块级变量存 per-account 状态** —— 宿主是同一个进程跑所有账号。设备记录的键是 `uidOf(auth)`（会变），**换键只能迁移那条记录**：按 `accountScope` **完全相等**找回，identity 公钥与 installationId 不动，**绝不按名字/作用域复制别人的私钥**。判据：`node --test tests/device-key.test.mjs tests/account-device.test.mjs` 退出 0 | `src/store.mjs` 的 `fileOf` · `src/device-key.mjs` 的 `adoptInstallationByScope` |
+| 17 | 接口抖一下，列表整个空掉；或某个模型缺价格，用户选了报错 | **部分成功有三态**，方向要各自选对：① 整个接口失败 → 退回上次快照（不要返回空表）② 接口成功但单条缺字段（缺 id、缺价格、`null`、空对象、负数）→ **不列**（不猜，也**不补一个 0** —— 补 0 等于宣称免费，见坑 2）③ 登录失效 → 抛 `signIn: "expired"`。判据：`node --test tests/catalog.test.mjs tests/models-adapters.test.mjs` 退出 0 | [`src/models.mjs`](./src/models.mjs) 的 `buildModels` · `src/catalog.mjs` 的 `parseCatalog` |
+| 18 | 越改越乱，`index.mjs` 涨到几百行，改一个钩子要读全篇 | 成熟形态是**`index.mjs` 只做九项钩子的装配，实现全在 `src/`**。实测四个真实插件的 `index.mjs` 是 80~715 行，而 `src/` 是 1.4k~3.7k 行 —— **本仓库同样是这个形态：`index.mjs` 只做九项装配（额度卡片已搬进 `src/usage-windows.mjs`），实现全在 `src/` 里**。模块数不写死在文字里（合并一次就变）：要看就 `ls src/*.mjs \| wc -l` | 本文件「五、长大之后」 |
 
-还有两条是 **magpie 0.1.1763 重新提取契约后才发现**的（2026-10-28）：
+还有一批是**后来的契约核对与真机实测**补出来的（最早一批起于 magpie 0.1.1763，2026-10-28；39~41 来自 0.1.1 的隔离浏览器 / 出站 origin / 设备身份收尾）：
 
 | # | 症状 | 判据 | 出处 |
 |---|---|---|---|
@@ -84,11 +84,15 @@ PR 是 GitHub 对受保护分支的技术要求（直推报 `GH006`），批准�
 | 31 | 非流折叠后出现 `function.name: ""`，客户端保存了不可调用的工具 | 参数/id 可先到，但流末仍无名的 tool_call 必须丢弃；若整轮只有它就抛 `status=502 / nameless=true`，有文本或命名调用则保留原答案 | `src/openai-sse.mjs` · `tests/openai-sse.test.mjs` |
 | 32 | 空闲超时后下一段首块消失；或额度接口一抖卡片就没数 | reader 超时只摘等待者，在飞块入队；usage 用 SWR 返回旧成功值并后台单飞，无旧值才做有界等待 | `src/stream-reader.mjs` · `src/usage-cache.mjs` |
 | 33 | 同一条厂商时间在 CI 与本地差 8 小时 | 无 zone 时间先给显式 `offset` 再转 ISO；不能让 `Date.parse` 先按宿主本地时区吃掉；自带 Z/offset 不覆盖 | `src/quota.mjs` 的 `toIso` · `tests/semantics.test.mjs` |
-| 34 | 登录补任务和每日签到撞在一起，重复领奖或重复上报；两个同名账号还串成一把锁 | 同账号 single-flight 共享同一 Promise，`replayMs:0` 不回放成功；key 用 uid/凭据指纹，**不用可重名的 accountId**；签到上报用前后账单差集，缺 before 时保守 `done` | `index.mjs` · `src/checkin.mjs` |
+| 34 | 登录补任务和每日签到撞在一起，重复领奖或重复上报；两个同名账号还串成一把锁 | 同账号 single-flight 共享同一 Promise，`replayMs:0` 不回放成功；key 用 uid/凭据指纹，**不用可重名的 accountId**；签到上报用前后账单差集，缺 before 时保守 `done`。**签到不要求「先发一次模型请求」**：设备未就绪时用户主动点签到 = 显式动作，按 `profile → register → activities → rewards → claim` 自己备好身份；注册失败**如实 `failed`**（带状态码/原因），绝不改写成 `claimed`，也不继续领奖 | `index.mjs` · `src/checkin.mjs` · `src/production-auth.mjs` 的 `ensureInstallationReady` |
 | 35 | live 新模型继承了第一个模型的 1M 窗口/看图能力，或静态表把无权限模型补回来 | 只按相同 id 合并静态元数据；未知模型不猜，目录失败才回快照，live 缺项不补回 | `src/models.mjs` · `tests/models-adapters.test.mjs` |
 | 36 | **卡片上的图标是个圆的**，四角露出深色底，和旁边别的插件不齐 | magpie 把图标画在**圆角方框**里；官网 favicon 常是「品牌徽标」，WorkBuddy 那份 `logo.svg` 里 `rect rx="20"`（40 宽画布）就是正圆。真正的**应用图标**在客户端安装包里 —— Windows exe 的 PE 资源 `RT_ICON` 存着 16~256 多档 PNG，256 那档拖出来就是官方原图：`node scripts/app-icon.mjs <installer.exe> --data-uri`。判据：**别只看 favicon**；两处都要写（`auth.icon` 与 `package.json` 的 `magpie.icon`，见 HOOKS 九之三） | `scripts/app-icon.mjs` · HOOKS 九之三 |
 | 37 | **插件里的模型比厂商网页上少几个，或者倍率 / 上下文不对** | 厂商常有**两份目录**：客户端读的那份（如 `/v3/config`）更新慢，控制台 / 网页那份带完整的分角色元数据。用 [`src/catalog-union.mjs`](./src/catalog-union.mjs) 合并：控制台那份作**主目录**（同 id 用它），配置那份补它没有的 id 和促销表；`auto` / 补全 / 过小输出 / 生成图这些非聊天行过滤掉。**两份都读不到要抛**（调用方回退上次快照），返回 `[]` 会被宿主当成「这家没有模型」 | `src/catalog-union.mjs` · 本文件坑 17 |
-| 38 | **上游偶发或固定回 403 `TM.00000001`（文案是「网络繁忙，请稍后重试」），重试和换账号都没用**；或者某个 provider 换到新网络 / 新账号后就不通 | 每个打上游的 `fetch` 都**显式**带 `User-Agent`，值是**该服务官方客户端**的 UA —— 绝不写 `<包名>/<版本号>`，也绝不让宿主的 `magpie/<version>` 透传（插件不设 UA 时它就这么上去）。官方是网页就用完整 Chrome UA；有 App / CLI 客户端就用那个客户端的 UA。判据：`node scripts/check-ua.mjs` 退出 0（`npm run check` 也卡这一条） | `src/http.mjs` 的 `OFFICIAL_UA` · `scripts/check-ua.mjs` |
+| 38 | **上游偶发或固定回 403 `TM.00000001`（文案是「网络繁忙，请稍后重试」），重试和换账号都没用**；或者某个 provider 换到新网络 / 新账号后就不通 | 每个打上游的 `fetch` 都**显式**带 `User-Agent`，值是**该服务官方客户端**的 UA —— 绝不写 `<包名>/<版本号>`，也绝不让宿主的 `magpie/<version>` 透传（插件不设 UA 时它就这么上去）。官方是网页就用完整 Chrome UA；有 App / CLI 客户端就用那个客户端的 UA。判据：`node scripts/check-ua.mjs .` 退出 0。注意 `npm run check` 对「每个打上游的文件是否显式带 UA」只给**警告**（静态拼不出的算不出来），别把警告当门 | `src/http.mjs` 的 `OFFICIAL_UA` · `scripts/check-ua.mjs` |
+| 39 | 请求**成功**、日志干净，但用户从此收不到额度 —— 某处把绝对 URL 原样转发（或上游回了个 URL），**账号的 access token 发到了别的主机** | 出站 URL 一律过 `src/origin.mjs` 的 `trustedUrlOf`：① protocol 必须 `https` ② origin 与 `src/context.mjs` 的 `BASE` **逐字相等**（`code.phanthy.com.evil.com` / `evil.phanthy.com` / 非默认端口全部拒）③ 不许 userinfo ④ 相对路径只能单个 `/` 开头（`//host/x` 是协议相对、反斜杠有分隔符语义，都拒），错误信息里**不回显 userinfo**。数据面与 loader 共用这一个闸门。判据：`node --test tests/origin.test.mjs` 退出 0 | `src/origin.mjs` · `tests/origin.test.mjs` |
+| 40 | 点「+」加新号，结果**直接进了旧账号**（授权页用了日常浏览器的会话），用户以为加了新号 | 默认 OAuth 每次登录开**一次性** `user-data-dir`（`mkdtemp` 落在系统临时目录）：不读 / 不复制 / 不删日常 profile，不带扩展，不开调试端口；callback 的 finally 只关**本次**进程、只删**本次**目录（失败 / 取消 / 超时同样先清垃圾）。临时目录一旦指向日常 profile 就拒绝启动，且绝不删那个目录。判据：`node --test tests/isolated-login.test.mjs` 退出 0（含「两个并发登录目录互不相同、关一个不影响另一个」） | `src/isolated-login.mjs` · `tests/isolated-login.test.mjs` |
+| 41 | 同一个号**每刷新一次 token 就变成一台新设备**：卡片上额度窗口重复、服务端攒一堆孤儿安装记录 | api 型登录态 magpie 只持久化 `{type, key, metadata}` —— 稳定身份**只能**写 `metadata.userId`（= `fingerprint(accountScope)`）与 `metadata.accountScope`，且 `refresh` 必须**合并**返回（只给 `{email}` 会把它们冲掉 ⇒ 又退回「凭据指纹」）。登录成功即**纯本地**分配/复用它自己的三把密钥（零请求）；旧记录按**完全相同**的 scope 迁移，identity 公钥与 installationId 不动；不同 uuid 各自独立。判据：`node --test tests/account-device.test.mjs tests/credential.test.mjs` 退出 0 | `src/credential.mjs` 的 `metadataWithIdentity` / `accountScopeOf` · `src/device-key.mjs` 的 `adoptInstallationByScope` |
+| 42 | 发版了、CI 全绿，**Release 正文却是空的**，用户看不到这次改了什么 —— 因为 `version` 已经 bump，CHANGELOG 却还没写这一节 | 门 ⑧ 的判据是**段首标题** `## <version>`，**不是正文子串**：正文里 `magpie ≥ 0.1.1763` 含「0.1.1」，会把根本没写的 0.1.1 蒙成绿（旧实现 `chg.includes(version)` 就这么漏的）。另外版本号要按**字面量**比对（`.` 必须转义）并带**右边界**：`## 0.1.1` 不许替 `## 0.1.10` 或 `## 0.1x1` 过关。判据：`node --test tests/check-version.test.mjs` 退出 0（5 条：真标题通过 / 正文子串失败 / 前缀 / 转义 / 带后缀版本各自只认自己） | `scripts/check.mjs` 的门 ⑧ `changelogHasVersion` · `tests/check-version.test.mjs` |
 
 ---
 
@@ -198,7 +202,7 @@ node scripts/app-icon.mjs <installer.exe> --size 256 --out icon.png
 
 | 仓库 | `index.mjs` | `src/` | `tests/` |
 |---|---|---|---|
-| 本仓库 | 只做装配（见坑 18，行数不抄） | 39 文件 | 47 |
+| 本仓库 | 只做装配（见坑 18，行数不抄） | 看 `ls src/*.mjs` | 看 `ls tests/*.test.mjs` |
 | `magpie-magicrew-auth` | **86** | 27 文件 / 7,773 行 | 17 |
 | `magpie-officeace` | 383 | 8 文件 / 1,566 行 | 2 |
 | `magpie-loomy-auth` | 611 | 9 文件 / 1,905 行 | 4 |
@@ -206,7 +210,7 @@ node scripts/app-icon.mjs <installer.exe> --size 256 --out icon.png
 
 结论：**`index.mjs` 只做装配，实现全在 `src/`** —— 最成熟的那个（magicrew）index 只有 86 行。
 
-已经备好 39 个 `src/` 模块（前四块四个插件里 4/4 都有；其余来自社区与当前真实启用插件的择优回收，
+`src/` 已经备好一批模块（**数量不写死**，看 `ls src/*.mjs`；前四块四个插件里 4/4 都有；其余来自社区与当前真实启用插件的择优回收，
 2026-11-03 的 17 项启用清单、哈希对照与排除边界见 [RECYCLING.md](./RECYCLING.md)）：
 
 | 文件 | 里面写什么 | 为什么单独拎出来 |

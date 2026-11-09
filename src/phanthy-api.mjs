@@ -13,7 +13,7 @@
 import { randomUUID } from "node:crypto"
 
 import { ApiError, TIMEOUT, headersFor, read } from "./api.mjs"
-import { BASE } from "./context.mjs"
+import { trustedUrlOf } from "./origin.mjs"
 import {
   CATALOG_PATH,
   CATALOG_STATS_PATH,
@@ -53,7 +53,11 @@ export const ACTIVITY_SUMMARY_PATH = "/api/oauth/activities/summary"
 
 /** 数据面默认 UA / 头由 api.mjs 统一给，这里只补签名头 */
 function urlOf(path) {
-  return path.startsWith("http") ? path : `${BASE}${path}`
+  // ⚠ 出口守卫（`src/origin.mjs`）：绝对 URL 必须是 BASE 的 https origin；
+  //   相对路径按 BASE 拼好之后同样再验一遍。凭据（Bearer / 指纹头）只发到这一台主机，
+  //   拼错或把上游回给我们的 URL 原样转发都会在这里先抛 `untrusted_origin`，
+  //   而不是「请求成功、账号送到别人手里」。
+  return trustedUrlOf(path).href
 }
 
 /**
@@ -107,6 +111,9 @@ export async function request({
     method,
     headers: headersFor(auth, extra),
     body: bodyString === "" ? undefined : bodyString,
+    // ⚠ L-5：`x-desktop-signature` / `x-desktop-installation-id` 在跨站 3xx 时
+    //   **会被 undici 转发**（authorization 反而会被剥掉），所以一律 manual。
+    redirect: "manual",
     signal: signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal,
   })
   return read(res, url)
@@ -174,7 +181,10 @@ export async function requestInferenceToken({
     })
   }
   if (!record.inferencePublicKey) {
-    throw new ApiError("安装记录缺少 inference 公钥（重新跑一次设备注册会补齐）", {
+    // ⚠ M-1：**不要**写「重新跑一次设备注册会补齐」—— adopt 路径会因为
+    //   `registeredAt` 已有值而跳过注册，重跑也补不上，用户只会反复看到同一条假错误。
+    //   真正能修的是「修复 / 迁移安装记录」这条链。
+    throw new ApiError("安装记录缺少 inference 公钥（请先修复 / 迁移安装记录以补齐密钥）", {
       status: 409,
       code: "not_implemented",
     })
@@ -238,6 +248,8 @@ export async function registerDevice({
     method: "POST",
     headers: headersFor({}, built.headers),
     body: built.bodyString,
+    // ⚠ L-5：注册是**写面**，签名头比 Bearer 更不能跟着 3xx 走。
+    redirect: "manual",
     signal: signal
       ? AbortSignal.any([signal, AbortSignal.timeout(TIMEOUT.long)])
       : AbortSignal.timeout(TIMEOUT.long),
