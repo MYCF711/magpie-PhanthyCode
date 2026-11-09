@@ -432,6 +432,88 @@ key），但 **magpie 自己从不传账号键**：
 
 ---
 
+## 四之一、provider 级开关（`auth.options`）与邀请源
+
+插件可以声明「整个 provider 共用」的开关，位置在 `auth` 的 **`options[]`** —— 不是 `methods[]`，
+也不是 `prompts[]`：
+
+```js
+auth: {
+  options: [
+    {
+      key: "invite_mode",        // ^[a-z0-9_-]{1,40}$；最多 16 个，重复 key 只保留第一个
+      label: "邀请模式",          // 必填，≤60 字符
+      description: "…",          // ≤300
+      default: false,            // 缺省 = false
+      placement: "top",          // ↓ 只有这一个字符串值有意义
+    },
+  ],
+}
+```
+
+**`placement` 的字段级契约**
+
+- 值是**字符串** `"top"`。契约里的归一化只有一句：`placement: o.placement === "top" ? "top" : undefined`
+  —— `top: true`、`placement: true`、`"bottom"`、缺省，**全部**等于「不指定」。
+  所以**不要写 `top: true`**：宿主只读 `placement`，`top` 这个字段根本不存在。
+- 位置：`"top"` 把它画在**账号下方、Routing 上方**；其余开关画在**模型下方**（不是整个弹窗第一行）。
+- 最低版本 **magpie 0.1.2985**（release note：*Fixed the "top" placement option … now appears
+  under accounts and above Routing*）。**旧版忽略该字段：开关照样能用，只是留在最下面的「插件选项」，不报错**
+  —— 所以不要写版本硬判断，也不要为它抛错。
+- **实时读取**：`input.magpie.option(provider, key) === true`（用户设过就用用户的值，否则用声明的 `default`）。
+  用户拨开关**不会**重跑插件工厂（只会重新拉一次模型列表），所以在工厂构造时读一次并缓存 = 要求用户重启才生效。
+  正确做法：在 `ask()` / `authorize()` 的**使用点**每次现读，并用可选链兜底（测试里 `_ctx` 常是 `{}`）。
+
+**开关语义（`invite_mode` 一个开关，两个方向）**
+
+| 值 | 邀请源 | 没有可用源时 |
+|---|---|---|
+| **off**（默认） | **最新注册账号**的邀请链接；最新没码 / 已被判死 → 往前退**上一个有码且合格**的账号 | 用户**预留码** → 再没有就**不带邀请**（裸登录） |
+| **on** | **magpie 首选账号**（账号行「Make first」）的码 | **只**回退预留码，**绝不静默换别的账号** |
+
+- 「最新」的判据是**本机第一次见到这个账号**的时刻（`firstSeenAt` 只写一次），**不是**最后登录时间 ——
+  否则重登旧号会把下一次注册挂到旧号名下（界面一切正常、没有任何报错）。
+- 账号选择**不在插件里**：magpie 0.1.3371 的插件控件只有布尔开关（`auth.options` 没有
+  `type` / `values` / `options` 字段），**没有账号下拉框**。首选由 magpie 账号行原生的
+  「Make first」（`logins.json` 的 `first` / `order`）决定，插件只**读**它：
+  `first: true` → 最小正 `order` → 第一行，`home` 再进 `plugin-auth.json` 取 `metadata.userId`；
+  读不到 / 结构变了 → 首选未知 → 回退预留码（**不静默换人**，也不因为文件改格式就崩）。
+- 键只能是 **uid**（`metadata.userId` = `fingerprint(accountScope)`）：`accountId` 是显示名
+  （打码手机号 / 昵称），可重名、可改名、重登会变；拿它当键 = 同一个人换一次 token 就变成两个人。
+- **手填优先**：`ask({ invite })` 里填了非 `0` / `1` 的码就覆盖自动源；
+  `0` / `1` / 留空 = 走自动源（最新 / 首选，含预留兜底）。
+  自动派生的码**只**进每账号缓存，**永不**覆盖预留文件
+  `~/.cache/magpie/phanthycode-invite.json`。
+
+**采集边界（账号自己的码从哪来）**
+
+- 只在该账号**自己的 `usage()` / `checkin()`** 里采集：该 uid 已有码 → 跳过；距上次尝试
+  **< 24h**（失败也计入冷却）→ 跳过；设备**未注册**（`isDeviceRegistered`，纯本地判据）→ 跳过，
+  **绝不 force 注册**、不换 key、不拿别人的 token。
+- 顺序是**先查资格、再取码**：`GET /referrals/me`（只读资格，**永远没有码**）→
+  `eligible_to_invite !== true` 就零 POST → 合格才 `POST /referrals/code`
+  （body 字面量 `{}` + `idempotency-key: referral-code:<installationId>:<ms>` + v1 签名）。
+- 任何失败只把 reason 记进内存，**不影响** `usage` 主结果、**不让签到变红**，也不伪造奖励
+  （绝不写 `tier_granted_count` / `relations`）。
+- 每个账号只用**自己的** Bearer + 设备签名取自己的码；跨账号绝不借码。
+
+**出站：`ask()` 有、`authorize()` 零**
+
+- 分享页 `GET /r/<code>` 只允许在 **`ask()`** 里抓、每次**至多一次**（匿名 GET、同 origin、
+  官方 UA、`redirect: manual`、10s 超时；失败只降级）。
+- **`authorize()` 里零出站**：它只读本次进程里换好的 `referral_state` 去包装授权 URL
+  （`/login?next=<完整授权 URL 逐字>&referral_state=rs1.…`），**不重抓分享页**。
+  `authorize()` 必须立刻返回（铁律 2：在它里面 await 用户会死锁）。
+- **`referral_state` 必须挂在 `/login` 的顶层**：写到 `/oauth/authorize` 上只会被折进 `next`，
+  而 `/login` **不读** `next` 里的它。`rs1.…` 只能从公开分享页 `/r/<code>` 的 HTML 里取。
+- 失败 / 没有码 / 本次没换到 state → **回退裸授权 URL**，登录照常完成；说明文案只给固定
+  reason 词表，**不含**邀请码、`share_url`、`referral_state` 原值。
+- **老账号不能补绑**：邀请关系只在**注册那一刻**建立，已有账号事后补填会被服务端拒绝
+  （409，且无副作用）。**不要重试**，也不要在登录路径上调 `referrals/bind` ——
+  它不是「让邀请生效」的入口。
+
+---
+
 ## 四之二、登录的三种形态（决定弹不弹浏览器）
 
 | 形态 | 形状 | 弹窗口？ | 前提 | 实测结论 |

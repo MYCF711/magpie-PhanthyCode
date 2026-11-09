@@ -71,6 +71,15 @@ import { ensureInstallationReady, isInstallationReady } from "./src/production-a
 import { launchIsolatedLogin } from "./src/isolated-login.mjs"
 import { detectLocalLogin, readImportedAccess, summarizeDetection } from "./src/local-import.mjs"
 import { OFFICIAL_UA, isLoginBroken } from "./src/http.mjs"
+import { createInviteSourceStore, parseInviteShareCode } from "./src/invite-source.mjs"
+import {
+  buildInviteLoginUrl,
+  createInviteStore,
+  fetchReferralState,
+  resolveInvite,
+} from "./src/invite.mjs"
+import { readPreferredUid } from "./src/preferred.mjs"
+import { fetchReferralCode, fetchReferralMe, isDeviceRegistered } from "./src/referrals.mjs"
 import {
   CALLBACK_PATH,
   buildAuthorizeUrl,
@@ -97,16 +106,99 @@ import { createUsageCache } from "./src/usage-cache.mjs"
 
 const ANTHROPIC_VERSION = "2023-06-01"
 
+// ═══ 邀请模式（provider 级开关）════════════════════════════════════════
+//
+// 契约见 MAGPIE-TOP-CONTRACT.md：`auth.options[]` 的一个开关，`placement: "top"`
+// 让 magpie ≥ 0.1.2985 把它画在**账号下、Routing 上**；旧版忽略该字段，开关留在
+// 底部「插件选项」，不报错。**不要**写 `top: true` —— `optionsOf` 只读 `placement`。
+//
+// ⚠ 用户最终确认的语义（推翻旧的「关闭 = 不带邀请」）：
+//
+//   off（默认）= 自动：用「最新注册账号」的邀请链接；最新还没码就回退上一个可用账号；
+//                       一个都没有 → 用户预留码；再没有 → 不带邀请、照常登录。
+//   on         = 首选：只用 magpie 账号页「Make first」那个账号的码；
+//                       首选没码 / 不可用 → **只**回退预留码，绝不静默换别的账号。
+
+/** 开关 key（magpie 契约：`^[a-z0-9_-]{1,40}$`） */
+const INVITE_MODE_KEY = "invite_mode"
+
+/** 邀请码输入的 key（用户手填时可以覆盖自动源；0 / 1 表示沿用预留） */
+const INVITE_INPUT_KEY = "invite"
+
+/** 登录说明（保持 0.2.x 原文，一句话都不多问） */
+const LOGIN_INSTRUCTIONS =
+  "已打开独立登录窗口（不带你日常浏览器的 Cookie 或旧账号会话）。请在里面完成 Phanthy 登录，完成后窗口会自动关闭。"
+
+/** 邀请链接已包进 `/login` 时的补充说明（文案**不含** code / state 原值） */
+const INVITE_READY_NOTE = "邀请链接已准备，仅新注册账号有效。"
+
 /**
- * 两种登录提示语。
+ * 邀请源 → 给人看的名字。**只**用固定词表：绝不把 code / state / 账号名原值
+ * 拼进登录说明（C15）。
+ */
+const INVITE_SOURCE_TEXT = {
+  latest: "最新注册账号",
+  preferred: "magpie 首选账号（Make first）",
+  reserved: "预留邀请码",
+  none: "无可用邀请源",
+}
+
+/**
+ * 「邀请链接未准备」的 reason 分类文案。
+ *
+ * 值是给人看的，键是 `src/invite.mjs` / `src/invite-source.mjs` 的固定 reason
+ * 词表 —— **不要**把上游返回的原文塞进来（邀请码 / state 一律不进日志，C15）。
+ */
+const INVITE_REASON_TEXT = {
+  no_code: "未填写邀请码",
+  no_state: "分享页里没有邀请状态",
+  empty: "未填写邀请码",
+  invalid_code: "邀请码格式不合法",
+  short_invite_code: "人类可读短码只能在注册页手填",
+  credential: "看起来是凭据，不是邀请码",
+  untrusted_origin: "服务地址不可信",
+  untrusted_scheme: "链接不是 https",
+  redirect: "分享页要求跳转",
+  http_error: "分享页返回错误",
+  timeout: "分享页超时",
+  aborted: "分享页请求被取消",
+  network: "分享页网络错误",
+  preferred_missing: "没有首选账号（请在 magpie 账号页用 Make first 指定）",
+  preferred_ineligible: "首选账号没有邀请资格",
+  preferred_no_code: "首选账号还没有邀请链接",
+  no_account_code: "没有任何账号的邀请链接",
+  reserved_unusable: "预留邀请码不可用",
+}
+
+/** 进程内最多记住几个邀请码的 state（按 code 分开记，不同码互不覆盖） */
+const MAX_REMEMBERED_INVITE_CODES = 8
+
+/**
+ * 每个账号最多每 24 小时尝试采集一次自己的邀请码。
+ *
+ * 采集是**写面**（`POST /referrals/code`）+ 幂等键，失败也计入冷却 ——
+ * 否则一次 5xx 会让卡片刷新反复打上游写接口。
+ */
+const INVITE_HARVEST_INTERVAL_MS = 24 * 60 * 60_000
+
+/**
+ * 采集的**有界超时**。
+ *
+ * `usage()` 是宿主画卡片时同步等的：采集是「顺手做的事」，绝不能让卡片等满
+ * 两次 10 秒（审核 M2）。2 秒拿不到就放弃，下次再采 —— 失败只降级。
+ */
+const INVITE_HARVEST_TIMEOUT_MS = 2_000
+
+/**
+ * 「隔离窗口没开成」时追加的登录提示语。
  *
  * ⚠ 「开了隔离窗口」只是**尽力而为**，不是登录的前提：没有 Chromium（macOS 只有 Safari、
  *   Linux 只有 Firefox、无 GUI 的机器）、启动报错、或者单实例浏览器把参数转交给了已运行
  *   的实例，都仍然要能把 `url` 交回宿主、由系统默认浏览器打开 —— 否则这类用户从 0.1.x
  *   升级上来就**彻底没有 OAuth 入口**了（只剩「从本机导入」，而它要求装过官方桌面端）。
+ *
+ * 邀请模式自己的说明由 `inviteLoginOf()` 给（裸登录 / 带邀请两种文案），这里只追加。
  */
-const ISOLATED_LOGIN_NOTE =
-  "已打开独立登录窗口（不带你日常浏览器的 Cookie 或旧账号会话）。请在里面完成 Phanthy 登录，完成后窗口会自动关闭。"
 const FALLBACK_LOGIN_NOTE =
   "没能打开独立登录窗口（没找到 Chromium / 启动失败 / 被已有的浏览器实例接管），已改用你的默认浏览器打开授权页。"
 
@@ -185,6 +277,56 @@ export const PhanthyCodeAuthPlugin = async (_ctx = {}, _options = {}) => {
   // 模型目录：按账号缓存 10 分钟、失败 30 秒、同 key 单飞；上游挂了退回上次快照。
   const catalogCache = createCatalogCache({ ttlMs: 10 * 60_000, failTtlMs: 30_000 })
 
+  // 邀请码策略：`~/.cache/magpie/phanthycode-invite.json`（与 `src/invite.mjs` 同一份）。
+  // 只存「用哪个码、这个码换到的 referral_state」——不存任何凭据。
+  // ⚠ 这是**用户预留**那条：自动派生的码只写下面的 inviteSources，**永不**写它。
+  const inviteStore = createInviteStore(PROVIDER)
+
+  // 账号索引 + 每账号自己的邀请码（`~/.cache/magpie/phanthycode-invite-*.json`）。
+  // 键是 uid（`metadata.userId` = `fingerprint(accountScope)`），不是可重名的 accountId。
+  const inviteSources = createInviteSourceStore(PROVIDER)
+
+  // 采集节流：每个 uid 最近一次尝试的时间与 reason（只在本进程内）。
+  // 只用来「24h 内别重复打写面」；真正的去重判据是 `inviteSources.readCode(uid)`。
+  const inviteHarvestAttempts = new Map()
+
+  /**
+   * 本次 `ask()` 解析出的邀请源 —— `authorize()` 必须复用它。
+   *
+   * 为什么不能重新解析：宿主在 `prompts` 非空时传 `inputs`，但「直接 authorize」那条
+   * 路径传的是 `undefined`；两次解析之间若插进一次采集，源可能从「最新账号」变成
+   * 「上一个账号」，`referral_state` 就永远对不上（静默不带邀请）。
+   * 消费后立刻清空 —— 它只对紧接着的那一次 authorize 有效。
+   */
+  let pendingInviteSource = null
+
+  // 同一账号的并发采集合并成一次（usage 与 checkin 可能同时触发）。
+  const inviteHarvestLock = createRefreshLock({ replayMs: 0 })
+
+  // 本次进程内「每个邀请码各自换到的 referral_state」。
+  // ⚠ 必须是 Map（按 code 分开）：用户可能先填 A 再改成 B，最后又填回 A ——
+  //   用单个变量存就会拿 B 的 state 去配 A 的码（邀请不生效，且没有任何报错）。
+  const referralStates = new Map()
+
+  /**
+   * 邀请模式开关 —— **实时**读，绝不在工厂构造时缓存。
+   *
+   * 契约（MAGPIE-TOP-CONTRACT §2.5）：用户拨动开关后 magpie 只重新拉一次模型列表，
+   * **不会重跑工厂**。构造时读一次就等于「切换后必须重启 magpie 才生效」。
+   * `_ctx` 在测试 / 旧宿主里可能是 `{}` / `null`，所以整条可选链兜底 → off。
+   *
+   * ⚠ 宿主侧异常按 **off** 处理，不许往上抛：这个函数在 `prompts` getter 里被调用，
+   *   抛一次就整条登录方式列表都拿不到（用户从此登不进去），而开关只是可选功能。
+   *   `option` 存在但不是函数时 `?.()` 会抛 TypeError，也走这里。
+   */
+  const inviteModeOn = () => {
+    try {
+      return _ctx?.magpie?.option?.(PROVIDER, INVITE_MODE_KEY) === true
+    } catch {
+      return false
+    }
+  }
+
   return {
     // ═══ ① 声明 provider ══════════════════════════════════════════════
     config: async (cfg) => {
@@ -206,6 +348,30 @@ export const PhanthyCodeAuthPlugin = async (_ctx = {}, _options = {}) => {
       maxConcurrency: 4,
       refreshLead: REFRESH_LEAD_MS,
 
+      // ═══ ① 插件选项（provider 级开关）══════════════════════════════
+      //
+      // 只声明**一个**开关，而且它是 provider 级策略，不是登录方式：
+      //   · 不要为了它新增 `methods[]` 条目（用户会被迫在登录方式里二选一）
+      //   · 不要写 `top: true`（那只是口语；`optionsOf` 只读 `placement`）
+      //   · 旧版 magpie（< 0.1.2985）忽略 `placement`，开关留在底部「插件选项」，不报错
+      options: [
+        {
+          key: INVITE_MODE_KEY,
+          label: "邀请模式",
+          description:
+            "关闭时自动使用最新注册账号的邀请链接（最新还没码则回退上一个可用账号，都没有才用你预留的邀请码）；" +
+            "开启时使用 magpie 账号页的首选账号（账号行「Make first」）作为邀请源。仅新注册账号可建立邀请关系。",
+          labels: { zh: "邀请模式" },
+          descriptions: {
+            zh:
+              "关闭时自动使用最新注册账号的邀请链接（最新还没码则回退上一个可用账号，都没有才用你预留的邀请码）；" +
+              "开启时使用 magpie 账号页的首选账号（账号行「Make first」）作为邀请源。仅新注册账号可建立邀请关系。",
+          },
+          default: false,
+          placement: "top",
+        },
+      ],
+
       // ═══ ② 登录 ═══════════════════════════════════════════════════
       methods: [
         {
@@ -213,10 +379,70 @@ export const PhanthyCodeAuthPlugin = async (_ctx = {}, _options = {}) => {
           label: `Sign in with ${PROVIDER_NAME}`,
 
           /**
+           * ⚠ 必须**非空**：宿主的分支是
+           *   `m.authorize(m.prompts?.length ? inputs ?? {} : undefined, …)`
+           * —— `prompts` 为空时它**永远**传 `undefined`，`ask()` 也就永远不会被问，
+           * 「手填码」与「预留兜底」在真实宿主上整条不可达（审核 H1）。
+           *
+           * 问题本身是**可留空**的：留空 = 走自动源（最新 / 首选）。不填就不打扰。
+           */
+          get prompts() {
+            return [invitePrompt()]
+          },
+
+          /**
+           * 邀请源的**唯一出站点**（HOOKS 四·陷阱 5）。
+           *
+           *   1. 第一次：只问邀请码（**零出站**）；
+           *   2. 回答后纯本地算源：`resolve({ preferFirst: inviteModeOn(), preferredUid, reservedCode })`
+           *      —— off = 最新注册账号（没码往前退），on = magpie 首选账号（没码只回退预留）；
+           *   3. 用户本次填了非 0 / 1 的码 → 覆盖自动源；
+           *   4. 有码才抓**一次** `/r/<code>` 换 `referral_state`；无码零请求；
+           *   5. 永远返回 `null`（没有下一个问题）。
+           *
+           * ⚠ 分享页只在这里抓：`authorize()` 里连一个字节都不许出站
+           *   （HOOKS 铁律 2 要求 authorize 立刻返回）。
+           */
+          async ask(inputs) {
+            // 第一次：先问邀请码（零出站）。留空 = 走自动源。
+            if (!hasInput(inputs, INVITE_INPUT_KEY)) return invitePrompt()
+
+            const source = resolveInviteSource(inputs)
+            // 宿主可能根本不把 inputs 交给 authorize（`prompts` 为空时传 undefined），
+            // 所以把这次解析出的源记下来，由 authorize 消费 —— 否则二次解析可能得到
+            // 不同的码（中间插了一次采集），state 就永远对不上。
+            pendingInviteSource = source
+            if (!source.code) return null // 没有码 = 不带邀请（零请求）
+
+            // 一次 ask 只抓一次公开分享页；失败只记 reason，不阻塞登录。
+            const { state: referralState, reason } = await fetchReferralState({
+              base: BASE,
+              code: source.code,
+              fetchImpl,
+            })
+
+            // 只有「预留」来源才回写策略文件（用户手填 / 0 / 1 沿用）。
+            // 自动派生的码**绝不**写它 —— 否则一次自动派生就把用户的兜底覆盖掉。
+            if (source.kind === "reserved") {
+              try {
+                inviteStore.write(source.code, {
+                  source: "chosen",
+                  extra: { referralState, referralStateAt: referralState ? Date.now() : "" },
+                })
+              } catch {
+                // 写失败不影响登录
+              }
+            }
+
+            rememberReferralState(source.code, referralState, reason, source.kind)
+            return null
+          },
+
+          /**
            * ⚠ 必须立刻返回：这里只做「开一个 loopback 监听 + 拼授权地址」，
            *   等用户完成登录的是 callback()。在 authorize 里 await 用户会死锁。
            */
-          async authorize() {
+          async authorize(inputs) {
             const state = randomState()
             const pkce = generatePkce()
             const listener = await startLoopback({ state, path: CALLBACK_PATH })
@@ -226,12 +452,15 @@ export const PhanthyCodeAuthPlugin = async (_ctx = {}, _options = {}) => {
             //   漏关的 loopback Server 会把端口占住、把进程吊到 300s 超时
             //   （review 实测 [still running after 120000ms]），用户点一次「+」就多一个。
             try {
-              const url = buildAuthorizeUrl({
+              const authorizeUrl = buildAuthorizeUrl({
                 base: BASE,
                 redirectUri: listener.redirectUri,
                 state,
                 codeChallenge: pkce.challenge,
               })
+              // 邀请模式：只**读** `ask()` 阶段换好的 referral_state，这里不抓分享页。
+              // 关闭 / 没有码 / 换 state 失败 → 保持裸授权 URL（与 0.2.x 完全一致）。
+              const { url, instructions } = inviteLoginOf(authorizeUrl, inputs)
               // 每次加号都**尝试**开一份全新的临时 profile，避免日常浏览器里的旧 Phanthy
               // 会话让授权页直接跳过登录。这里只等进程起来，不等用户登录。
               //
@@ -255,7 +484,8 @@ export const PhanthyCodeAuthPlugin = async (_ctx = {}, _options = {}) => {
 
               return {
                 url,
-                instructions: isolated ? ISOLATED_LOGIN_NOTE : FALLBACK_LOGIN_NOTE,
+                // 隔离窗口没开成：在邀请模式自己的说明后面追加「已改用默认浏览器」。
+                instructions: isolated ? instructions : `${instructions}${FALLBACK_LOGIN_NOTE}`,
                 method: "auto",
                 opened: isolated,
 
@@ -297,6 +527,9 @@ export const PhanthyCodeAuthPlugin = async (_ctx = {}, _options = {}) => {
                     // 登录即分配本机设备身份（纯本地：只生成/复用这个账号自己的三把
                     // ed25519，不发任何请求）。云端注册留到 checkin / loader。
                     allocateLocalDevice(uid, accountScope)
+                    // 「本机见过这个账号」—— 邀请源「最新注册账号」的唯一判据。
+                    // 只在拿到**稳定** accountScope 时记（凭据指纹会随 token 变，不能当账号）。
+                    rememberAccountSeen({ uid, accountScope, accountId })
 
                     return {
                       type: "success",
@@ -416,6 +649,8 @@ export const PhanthyCodeAuthPlugin = async (_ctx = {}, _options = {}) => {
               // 登录即分配本机设备身份（纯本地）。api 型凭据换一张 token 时，
               // 只要 accountScope 没变，这里就会命中同一条记录 ⇒ 同一个 installationId。
               allocateLocalDevice(uid, accountScope)
+              // 与 OAuth 出口同一判据：「本机见过这个账号」（firstSeenAt 只写一次）。
+              rememberAccountSeen({ uid, accountScope, accountId })
 
               return {
                 type: "success",
@@ -749,6 +984,8 @@ export const PhanthyCodeAuthPlugin = async (_ctx = {}, _options = {}) => {
           return { error: String(error?.message ?? error), windows: [] }
         }
 
+        // 有界采集（该账号自己的邀请码）。失败静默：绝不污染上面的额度主结果。
+        await harvestInviteCode(auth)
         return u
       },
 
@@ -761,7 +998,7 @@ export const PhanthyCodeAuthPlugin = async (_ctx = {}, _options = {}) => {
         if (!account) return { outcome: "failed", message: "凭据缺少账号指纹" }
 
         const key = `${provider?.id || PROVIDER}\n${account}`
-        return checkinLock.run(key, async () => {
+        const outcome = await checkinLock.run(key, async () => {
           // 签到/奖励全是 v1 签名请求：没有登记好的设备身份，连状态都读不到。
           // 设备身份由本插件自己生成（`src/device-key.mjs`），不碰桌面端任何凭据。
           //
@@ -899,6 +1136,10 @@ export const PhanthyCodeAuthPlugin = async (_ctx = {}, _options = {}) => {
             message: `签到失败${result.code ? `（${result.code}）` : ""}`,
           }
         })
+
+        // 有界采集：失败静默（绝不改签到 outcome、绝不让卡片变红）。
+        await harvestInviteCode(auth)
+        return outcome
       },
     },
 
@@ -945,6 +1186,326 @@ export const PhanthyCodeAuthPlugin = async (_ctx = {}, _options = {}) => {
 
   // ── 内部实现（不导出：导出会破坏「入口只有一个函数」的契约）────────────
   // 额度卡片的实现已搬进 `src/usage-windows.mjs`（AGENTS 坑 18：入口只做装配）。
+
+  // ── 邀请模式（provider 级开关的接线）──────────────────────────────────
+  //
+  // 下面几个都是**函数声明**（不是 `const` 箭头函数）：工厂的 `return` 在它们
+  // 之前执行，只有函数声明会被提升到函数作用域顶部 —— 用 const 的话，
+  // `prompts` / `ask` / `authorize` 里拿到的会是 TDZ 里的未初始化绑定。
+
+  /** `inputs` 里问过这个 key 没有 —— 用 hasOwnProperty，「填了空字符串」也算问过 */
+  function hasInput(inputs, key) {
+    return !!inputs && typeof inputs === "object" && Object.prototype.hasOwnProperty.call(inputs, key)
+  }
+
+  /** 用户预留的邀请码（只读；自动派生的码**永不**写这个文件） */
+  function reservedCodeOf() {
+    try {
+      return String(inviteStore.read() ?? "").trim()
+    } catch {
+      return ""
+    }
+  }
+
+  /** magpie 账号页「Make first」那个账号的稳定 uid；读不到就是空串（回退预留） */
+  function preferredUidOf() {
+    try {
+      return String(readPreferredUid(PROVIDER)?.uid ?? "").trim()
+    } catch {
+      return ""
+    }
+  }
+
+  /** 「没有任何来源」的固定形状（`code` 是空串，调用方走裸登录） */
+  function noInviteSource(reason) {
+    return {
+      code: "",
+      shareUrl: "",
+      kind: "none",
+      uid: "",
+      accountScope: "",
+      accountId: "",
+      reason: String(reason ?? "no_code"),
+    }
+  }
+
+  /**
+   * 邀请码问题 —— **可留空**：留空（或填 `0` / `1`）= 走自动源。
+   * 不是必填项，只是给用户「手动指定邀请人」的机会。
+   */
+  function invitePrompt() {
+    return {
+      type: "text",
+      key: INVITE_INPUT_KEY,
+      message: "邀请码（可留空：自动用最新账号 / magpie 首选账号）",
+      placeholder: "留空 = 自动；填 0 / 1 也走自动",
+    }
+  }
+
+  /**
+   * 这次登录该用谁的邀请码 —— **纯本地**（只读插件缓存与 magpie 的账号文件，零网络）。
+   *
+   *   · 没有 `invite` 键（旧宿主 / 直接 `authorize()`）：自动源
+   *       off → 最新注册账号（没码就往前退）→ 预留 → none
+   *       on  → magpie 首选账号（没码就**只**回退预留，绝不静默换别的账号）
+   *   · `invite` 是 `0` / `1` / 留空：用户没表达「换码」意图 → **同样走自动源**
+   *     （旧实现把这三个值当「沿用预留码」，会让自动源整层失效）
+   *   · `invite` 是其它文本：手填新码，**覆盖**自动源（来源记为「预留」）
+   *
+   * 返回形状固定：`{ code, shareUrl, kind, uid, accountScope, accountId, reason }`。
+   * `kind === "none"` 时 `code` 是空串（裸登录），**不抛**。
+   */
+  function resolveInviteSource(inputs) {
+    const reservedCode = reservedCodeOf()
+
+    const autoSource = () => {
+      try {
+        return inviteSources.resolve({
+          preferFirst: inviteModeOn(),
+          preferredUid: preferredUidOf(),
+          reservedCode,
+        })
+      } catch {
+        return noInviteSource("no_account_code")
+      }
+    }
+
+    if (!hasInput(inputs, INVITE_INPUT_KEY)) return autoSource()
+
+    // 0 / 1 / 留空 = 没有「换码」意图 → 自动源（含预留兜底）
+    const text = String(inputs?.[INVITE_INPUT_KEY] ?? "").trim()
+    if (text === "" || text === "0" || text === "1") return autoSource()
+
+    // 手填新码：覆盖自动源
+    const parsed = parseInviteShareCode(text)
+    if (!parsed.ok) return noInviteSource(parsed.reason)
+    return {
+      code: parsed.code,
+      shareUrl: parsed.shareUrl,
+      kind: "reserved",
+      uid: "",
+      accountScope: "",
+      accountId: "",
+      reason: "",
+    }
+  }
+
+  /** 记住一个邀请码换到的 state（按 code 分开记，最多 MAX_REMEMBERED_INVITE_CODES 个） */
+  function rememberReferralState(code, referralState, reason, kind) {
+    referralStates.set(String(code), {
+      state: String(referralState ?? ""),
+      reason: String(reason ?? ""),
+      kind: String(kind ?? ""),
+      at: Date.now(),
+    })
+    // 用户可能一路试很多个码：留最近几个就够，别把进程当数据库。
+    while (referralStates.size > MAX_REMEMBERED_INVITE_CODES) {
+      const oldest = referralStates.keys().next().value
+      referralStates.delete(oldest)
+    }
+  }
+
+  /**
+   * 当前邀请码对应的 referral_state —— **只读本次进程的 Map**。
+   *
+   * ⚠ 绝不回落到磁盘（M-1a）：`rs1.…` 是按分享链接**即时签发**、可能已经过期的
+   * 状态令牌；磁盘上那份只能证明「上一次某个码换到过 state」，不能证明它现在还有效。
+   * 拿旧 state 去包装 = 页面不报错、邀请静默失效。所以「本次没换到」就一律没有。
+   *
+   * 按 code 分开记：绝不允许拿 A 的 state 去配 B 的码。
+   */
+  function referralStateFor(code) {
+    const key = String(code ?? "")
+    if (!key) return ""
+    return String(referralStates.get(key)?.state ?? "")
+  }
+
+  /** 来源 → 展示文案（只用固定词表，**不含** code / state 原值） */
+  function inviteSourceLabel(kind) {
+    return INVITE_SOURCE_TEXT[String(kind ?? "")] ?? INVITE_SOURCE_TEXT.none
+  }
+
+  /** 「邀请链接未准备（reason 分类）」—— 文案只放 reason 词表，不放 code / state 原值 */
+  function inviteMissingNote(reason) {
+    const key = String(reason ?? "") || "no_state"
+    const text = INVITE_REASON_TEXT[key]
+    return `邀请链接未准备（${text ? `${key}：${text}` : key}），已按普通登录继续。`
+  }
+
+  /**
+   * 授权 URL + 登录说明。
+   *
+   * 没有码 / 本次没换到 state / 换 state 失败 → 原样返回裸授权 URL（照常登录）。
+   * 有合法 state → 包进 `/login?next=…&referral_state=…`。
+   *
+   * ⚠ state **只认本次进程的 Map**（M-1a）：`rs1.…` 是按分享链接即时签发、可能已经
+   *   过期的状态令牌；磁盘上留的属于「上一次」，套上去等于替一个（可能不同的）账号
+   *   静默建立邀请关系 —— 一律不带邀请。
+   *
+   * **纯读**：不联网、不写盘（分享页在 `ask()` 阶段就抓完了）。说明里要写清
+   * 「本次邀请源」（最新 / 首选 / 预留 / 无）与「仅新注册账号有效」，但**绝不**回显
+   * code / state 原值。任何异常都回退裸授权 URL —— 宁可邀请不生效，也不能让用户登不进去。
+   */
+  function inviteLoginOf(authorizeUrl, inputs) {
+    // 本次**显式**给了新码（非 `0` / `1` / 空）→ 用它：用户最后一次的意图优先。
+    // 否则用 `ask()` 记下的源 —— 宿主可能根本不把 inputs 交过来（传 `undefined`），
+    // 那时只有这份记录能证明「本次用的是哪个码」。
+    const typed = String(inputs?.[INVITE_INPUT_KEY] ?? "").trim()
+    const hasTypedCode = hasInput(inputs, INVITE_INPUT_KEY) && typed !== "" && typed !== "0" && typed !== "1"
+    const source = hasTypedCode ? resolveInviteSource(inputs) : (pendingInviteSource ?? resolveInviteSource(inputs))
+    pendingInviteSource = null
+
+    if (!source.code) {
+      return {
+        url: authorizeUrl,
+        instructions: `${LOGIN_INSTRUCTIONS} ${inviteMissingNote(source.reason || "no_code")}`,
+      }
+    }
+
+    const label = inviteSourceLabel(source.kind)
+    try {
+      const referralState = referralStateFor(source.code)
+      if (referralState) {
+        const wrapped = buildInviteLoginUrl({ base: BASE, authorizeUrl, referralState })
+        // 只有真的包上了才算「已准备」：state 非法 / origin 不可信时它原样返回授权 URL。
+        if (wrapped !== authorizeUrl) {
+          return {
+            url: wrapped,
+            instructions: `${LOGIN_INSTRUCTIONS} 本次邀请源：${label}。${INVITE_READY_NOTE}`,
+          }
+        }
+      }
+    } catch {
+      // 任何异常都不阻塞登录：回退裸授权 URL，登录继续。
+    }
+    const reason = referralStates.get(source.code)?.reason || "no_state"
+    return {
+      url: authorizeUrl,
+      instructions: `${LOGIN_INSTRUCTIONS} 本次邀请源：${label}，但${inviteMissingNote(reason)}`,
+    }
+  }
+
+  /**
+   * 记一次「本机见到这个账号」—— 邀请源「最新注册账号」的唯一判据。
+   *
+   * **纯本地、失败不阻塞登录**：`firstSeenAt` 只写一次（重登旧号不会把「最新」抢走），
+   * 拿不到稳定 `accountScope` 就不记（凭据指纹会随 token 变，不能当账号）。
+   */
+  function rememberAccountSeen({ uid, accountScope, accountId } = {}) {
+    const stableUid = String(uid ?? "").trim()
+    const scope = String(accountScope ?? "").trim()
+    if (!stableUid || !scope) return null
+    try {
+      return inviteSources.noteAccount({ uid: stableUid, accountScope: scope, accountId })
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * 有界采集：用**这个账号自己的** Bearer + 设备身份，把自己的邀请码取回来落盘。
+   *
+   * 触发条件（少一条都不发请求）：
+   *   ① 该 uid 还没有码（码是账号自己的，不会因为换 token 变）；
+   *   ② 距上次尝试 ≥ 24h（失败也计入冷却）；
+   *   ③ 设备已注册（`isDeviceRegistered`，纯本地判据）—— 没注册就跳过，
+   *      交给既有 loader / checkin 去完成注册，**绝不 force**。
+   *
+   * 顺序：先 `GET /referrals/me` 判资格，合格才 `POST /referrals/code`。
+   * 任何失败只记 reason（内存），**不影响** usage / checkin 的主结果、不让签到变红；
+   * 绝不调用 bind，也绝不碰推理端点。同一账号并发触发时用单飞锁合并。
+   */
+  async function harvestInviteCode(auth) {
+    try {
+      const account = String(uidOf(auth) ?? "").trim()
+      if (!account) return null
+
+      // 已经有码：不需要再采
+      if (inviteSources.readCode(account)) return null
+
+      const now = Date.now()
+      const last = inviteHarvestAttempts.get(account)
+      if (last && now - last.at < INVITE_HARVEST_INTERVAL_MS) return null
+
+      // 设备没注册：跳过（不 force、不换 key、不拿别人的 token）。
+      // ⚠ **不写冷却**：这次一条请求都没发，设备一注册就该立刻能采。
+      //   写 24h 冷却会让新账号的「最新」这层当天整天失效（审核 M1）。
+      const record = readInstallation(account)
+      if (!isDeviceRegistered(record)) return null
+
+      return await inviteHarvestLock.run(`invite-harvest\n${account}`, async () => {
+        // 并发合并后：第一次可能已经写过码 / 尝试过了
+        if (inviteSources.readCode(account)) return null
+        const started = inviteHarvestAttempts.get(account)
+        if (started && Date.now() - started.at < INVITE_HARVEST_INTERVAL_MS) return null
+
+        inviteHarvestAttempts.set(account, { at: Date.now(), reason: "" })
+        try {
+          // ① 只读资格：没资格就不写（绝不伪造奖励）
+          const me = await fetchReferralMe(auth, { fetchImpl, timeout: INVITE_HARVEST_TIMEOUT_MS })
+          if (!me.ok) {
+            inviteHarvestAttempts.set(account, { at: Date.now(), reason: me.reason || "failed" })
+            return null
+          }
+          if (me.me?.eligible !== true) {
+            const reason = String(me.me?.eligibilityReason ?? "").trim() || "ineligible"
+            inviteHarvestAttempts.set(account, { at: Date.now(), reason })
+            try {
+              inviteSources.markEligibility({ uid: account, eligible: false, reason })
+            } catch {
+              // 写失败不影响主流程
+            }
+            return null
+          }
+
+          // ② 合格才取码（body `{}` + 幂等键 + v1 签名都在 referrals.mjs 里）。
+          //    ⚠ 把上面那份 `me` 传进去复用：不传会**再 GET 一次** /referrals/me（审核 M2）。
+          const result = await fetchReferralCode(auth, {
+            record,
+            fetchImpl,
+            me: me.me,
+            timeout: INVITE_HARVEST_TIMEOUT_MS,
+          })
+          if (!result.ok) {
+            const reason = result.reason === "failed" ? result.failure : result.reason
+            inviteHarvestAttempts.set(account, { at: Date.now(), reason: String(reason ?? "failed") })
+            if (result.reason === "ineligible") {
+              try {
+                inviteSources.markEligibility({
+                  uid: account,
+                  eligible: false,
+                  reason: result.eligibilityReason ?? "",
+                })
+              } catch {
+                // 写失败不影响主流程
+              }
+            }
+            return null
+          }
+
+          inviteSources.saveCode({
+            uid: account,
+            code: result.code,
+            shareUrl: result.shareUrl,
+            slot: result.slot,
+          })
+          try {
+            inviteSources.markEligibility({ uid: account, eligible: true, reason: "" })
+          } catch {
+            // 写失败不影响主流程
+          }
+          inviteHarvestAttempts.set(account, { at: Date.now(), reason: "" })
+          return result
+        } catch {
+          inviteHarvestAttempts.set(account, { at: Date.now(), reason: "error" })
+          return null
+        }
+      })
+    } catch {
+      // 采集失败永远不影响主结果
+      return null
+    }
+  }
 
   /**
    * 聊天通道的请求器：把「超时 / 调用方取消」分类清楚（ERROR-CODES R8）。

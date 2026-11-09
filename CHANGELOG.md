@@ -3,6 +3,79 @@
 > 每个版本一节，**一条一行**，说用户能感知的变化。
 > 格式与规矩见 [UPDATING.md](./UPDATING.md)。
 
+## 0.2.0 — 2026-11-09
+
+**邀请模式：一个 provider 级开关（默认关）。关闭 = 自动用「最新注册账号」的邀请链接；
+开启 = 用 magpie 账号页的「首选账号」（Make first）。账号自己的邀请链接由插件在该账号自己的
+usage / checkin 里采集 —— 不改登录方式、登录路径不碰邀请写接口。**
+
+### 邀请模式（`invite_mode`）
+
+- **开关在哪**：`auth.options[]` 里的 provider 级开关，`default: false`，
+  `placement: "top"`。magpie **≥ 0.1.2985** 把它画在**账号下方、Routing 上方**；
+  旧版忽略该字段，开关回退到最下面的「插件选项」，**功能照常、不报错**。
+  字段是字符串 `placement: "top"`，**不是** `top: true`（`optionsOf()` 只读 `placement`）。
+- **开关实时生效**：每次问答 / 登录都重新读一次 `input.magpie.option(provider, key)`，
+  切换后**不用重启**。没有新增登录方式：`auth.methods` 仍是 `oauth` + `api`。
+- **关闭（默认）= 自动选源**：用**最新注册账号**的邀请链接；最新那个还没码（或已被判死）→
+  回退**上一个有码且合格**的账号；都没有 → 用**预留邀请码**；再没有 → **不带邀请、照常登录**。
+  「最新」= 本机**第一次见到**这个账号的时刻（`firstSeenAt` 只写一次），不是「最后登录时间」——
+  重登旧号不会把下一次注册挂到旧号名下。
+- **开启 = 首选账号**：只用 magpie 账号页「**Make first**」那个账号的码。首选没码 / 没资格 /
+  未设置 → **只**回退预留码，**绝不静默改用别的账号**。
+- **用户手填邀请码优先于自动源**：填非 `0` / `1` 的码 → 覆盖自动源；`0` / `1` / 留空 → 走自动源（最新 / 首选，含预留兜底）
+  （写成新的预留值）。预留值在 `~/.cache/magpie/phanthycode-invite.json`，
+  **不会被自动派生覆盖**（自动派生的码只进每账号的 `phanthycode-invite-code-<key>.json`）。
+
+### 三个新模块
+
+- **`src/referrals.mjs`** —— 「账号自己的邀请链接」：`GET /referrals/me` 只读资格
+  （**永远没有码**），`POST /referrals/code` 才是取码入口（body 字面量 `{}` +
+  幂等键 `referral-code:<installationId>:<ms>` + v1 签名）。不 bind、不重试、不碰推理端点、
+  不抓 `/r/<code>`、不把码写进日志。
+- **`src/invite-source.mjs`** —— 邀请源策略 + 本地缓存：账号索引
+  `phanthycode-invite-accounts.json`（只放身份与时间）、每账号
+  `phanthycode-invite-code-<key>.json`（只放白名单字段）。键是 **uid**
+  （`metadata.userId` = `fingerprint(accountScope)`），**绝不**用可重名的 `accountId`。
+- **`src/preferred.mjs`** —— 「首选账号」的只读解析：`logins.json` 的
+  `first: true` → 最小正 `order` → 第一行，`home` 再进 `plugin-auth.json` 取
+  `metadata.userId`。只读身份与选择字段，**绝不读** token；读不到就回退预留码（不静默换人）。
+
+### 邀请码从哪来（采集边界）
+
+- **只在该账号自己的 `usage()` / `checkin()` 里采集**：该账号已有码 → 跳过；距上次尝试
+  **< 24h**（失败也计入）→ 跳过；设备**未注册** → 跳过（绝不 force 注册）。
+  顺序是**先查资格（`/referrals/me`）、再取码（`/referrals/code`）**。
+- **失败只降级**：任何失败只记 reason（内存），不影响额度主结果、不让签到变红，也不伪造奖励。
+- **不借别人的码**：每个账号只用**自己的** Bearer + 设备签名取自己的码；token 刷新不换键。
+
+### 出站与日志
+
+- **`ask()` 是唯一出站点**：有码才抓**一次**公开分享页 `/r/<code>`（匿名 GET、同 origin、
+  官方 UA、10s 超时）；**`authorize()` 里零出站**，它只读本次进程里换好的 `referral_state`
+  去包装授权 URL（`/login?next=<完整授权 URL 逐字>&referral_state=rs1.…`）。
+- **失败不阻塞登录**：分享页失败 / 没有 `rs1.…` / 码为空或不合法 → 回退**裸授权 URL**，
+  登录照常完成；登录说明只给固定分类文案（`no_code` / `http_error` / `no_state` …），
+  **不含**邀请码、`share_url` 与 `referral_state` 原值。
+
+### 边界（明确不做）
+
+- **只对新注册账号有效**：邀请关系在**注册那一刻**建立；已存在的账号**不能事后补绑**
+  （服务端明确回 409），插件**不重试**、也不把它当临时故障刷屏。
+- **登录路径不调 referrals 写接口**：不会出现 `POST /api/oauth/referrals/bind`；
+  取码只发生在 `usage` / `checkin` 的有界采集里（每账号 24h 至多一次）。
+- **不伪造邀请奖励**：不写 `tier_granted_count` / `relations` / 奖励积分，也不把「已邀请」
+  当成本地状态。
+
+### 测试
+
+- 离线用例 **740 条全过**（新增/改写 `invite-source` / `referrals` / `preferred` /
+  `invite-wire` / `invite-mode` / `invite-protocol` 六份邀请相关测试）；全部假 `fetch` +
+  临时 HOME，不联网、不碰真凭证。
+
+> 插件侧**不校验、也不承诺**奖励是否到账：是否建立关系、是否计入奖励由服务端判定，
+> 离线测试覆盖的只是「源选择 / URL 构造 / 回退 / 采集边界 / 零 bind」这些可验证的契约。
+
 ## 0.1.1 — 2026-11-09
 
 **本地修复版：登录更省心、签到不再要求「先发一次模型请求」、价格未知的模型不再被当成免费。**
