@@ -418,10 +418,12 @@ test("宿主 option 抛错 / 不是函数：按 off 处理，prompts / ask / aut
     // 新语义：第一次 ask 一定返回「邀请码」问题（可留空 = 自动源）
     assert.equal((await method.ask({}))?.key, "invite", "第一次必须问邀请码（可留空）")
     assert.equal(await method.ask({ invite: "" }), null, "option 抛错时 ask 立刻返回 null")
-    assert.equal(await method.ask({ invite: "CODE-HOST-THROW" }), null)
+    assert.equal(await method.ask({ invite: "bad code" }), null)
 
-    const flow = await authorize(method, { invite: "CODE-HOST-THROW" })
-    assert.equal(new URL(flow.url).searchParams.get("next"), null, "off ⇒ 裸授权 URL")
+    // ⚠ 不能再用「形状合法但被旧短码规则拒掉」的输入：短码现在被接受（形状只判一次）。
+    //   这里要验的是「option 抛错时不炸」，所以用**非法形状**（空格）保证不带邀请。
+    const flow = await authorize(method, { invite: "bad code" })
+    assert.equal(new URL(flow.url).searchParams.get("next"), null, "非法码 ⇒ 裸授权 URL")
     const result = await finish(flow, "code-host-throw")
     assert.equal(result.type, "success", result.error)
     assert.equal(fetchImpl.shareCalls().length, 0, "off ⇒ 分享页零请求")

@@ -39,14 +39,20 @@ usage / checkin 里采集 —— 不改登录方式、登录路径不碰邀请�
   （`metadata.userId` = `fingerprint(accountScope)`），**绝不**用可重名的 `accountId`。
 - **`src/preferred.mjs`** —— 「首选账号」的只读解析：`logins.json` 的
   `first: true` → 最小正 `order` → 第一行，`home` 再进 `plugin-auth.json` 取
-  `metadata.userId`。只读身份与选择字段，**绝不读** token；读不到就回退预留码（不静默换人）。
+  `metadata.userId`，**取不到再认顶层 `uid`**（oauth 型登录态的真实形状；与 `uidOf()` 同序 ——
+  只认 `metadata.userId` 会让现有安装一律 `no_uid`、首选模式静默失效）。
+  只读身份与选择字段，**绝不读** token；读不到就回退预留码（不静默换人）。
 
 ### 邀请码从哪来（采集边界）
 
 - **只在该账号自己的 `usage()` / `checkin()` 里采集**：该账号已有码 → 跳过；距上次尝试
-  **< 24h**（失败也计入）→ 跳过；设备**未注册** → 跳过（绝不 force 注册）。
-  顺序是**先查资格（`/referrals/me`）、再取码（`/referrals/code`）**。
-- **失败只降级**：任何失败只记 reason（内存），不影响额度主结果、不让签到变红，也不伪造奖励。
+  **< 24h**（失败也计入，**冷却落盘**，重启 magpie 不会清零）→ 跳过；设备**未注册** →
+  跳过（绝不 force 注册）。顺序是**先查资格（`/referrals/me`）、再取码（`/referrals/code`）**。
+- **两个请求共用一个 2 秒总预算**（不是各 2 秒）：`usage()` / `checkin()` 都是 await 它的，
+  多账号时不能逐个叠加。
+- **失败只降级**：任何失败只记 reason，不影响额度主结果、不让签到变红，也不伪造奖励。
+- **重试复用同一把幂等键**：键里的 `<ms>` 按 24h 窗口固定（同一窗口内重试不会多要一张码），
+  签名时间戳仍取当前时间。
 - **不借别人的码**：每个账号只用**自己的** Bearer + 设备签名取自己的码；token 刷新不换键。
 
 ### 出站与日志
@@ -54,6 +60,11 @@ usage / checkin 里采集 —— 不改登录方式、登录路径不碰邀请�
 - **`ask()` 是唯一出站点**：有码才抓**一次**公开分享页 `/r/<code>`（匿名 GET、同 origin、
   官方 UA、10s 超时）；**`authorize()` 里零出站**，它只读本次进程里换好的 `referral_state`
   去包装授权 URL（`/login?next=<完整授权 URL 逐字>&referral_state=rs1.…`）。
+- **死码会被清掉**：分享页明确回 **404 / 410** 时删掉这张码（只认「明确不存在」，
+  超时 / 网络抖不动它），下一次选源自动往前退到上一个有码的账号，不会一直拿死码去换 state。
+- **码的形状只判一次**：与 `referrals.mjs` / `referralShareUrl` 同一口径；
+  上游回 `AB12-CD34-EF56` 这类短码也能落盘可用（旧实现会在 `saveCode` 里静默丢掉，
+  表现为「采集成功但磁盘上没有码」）。
 - **失败不阻塞登录**：分享页失败 / 没有 `rs1.…` / 码为空或不合法 → 回退**裸授权 URL**，
   登录照常完成；登录说明只给固定分类文案（`no_code` / `http_error` / `no_state` …），
   **不含**邀请码、`share_url` 与 `referral_state` 原值。

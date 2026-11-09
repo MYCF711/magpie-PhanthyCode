@@ -363,17 +363,17 @@ export function referralShareUrl(base = BASE, code) {
  */
 export async function fetchReferralState({ base = BASE, code, fetchImpl = globalThis.fetch, signal } = {}) {
   const c = String(code ?? "").trim()
-  if (!REFERRAL_CODE_RE.test(c)) return { state: "", reason: "invalid_code" }
+  if (!REFERRAL_CODE_RE.test(c)) return { state: "", reason: "invalid_code", status: 0 }
 
   let shareUrl
   try {
     shareUrl = referralShareUrl(base, c)
   } catch {
-    return { state: "", reason: "untrusted_origin" }
+    return { state: "", reason: "untrusted_origin", status: 0 }
   }
 
   // 调用方已经取消：不发明请求
-  if (signal?.aborted) return { state: "", reason: "aborted" }
+  if (signal?.aborted) return { state: "", reason: "aborted", status: 0 }
 
   const controller = new AbortController()
   let timedOut = false
@@ -419,16 +419,16 @@ export async function fetchReferralState({ base = BASE, code, fetchImpl = global
     ])
 
     const status = Number(res?.status ?? 0)
-    if (status >= 300 && status < 400) return { state: "", reason: "redirect" }
-    if (!(status >= 200 && status < 300)) return { state: "", reason: "http_error" }
+    if (status >= 300 && status < 400) return { state: "", reason: "redirect", status }
+    if (!(status >= 200 && status < 300)) return { state: "", reason: "http_error", status }
 
     const html = await res.text()
     const state = parseReferralState(html)
-    return state ? { state, reason: "" } : { state: "", reason: "no_state" }
+    return state ? { state, reason: "", status } : { state: "", reason: "no_state", status }
   } catch {
-    if (timedOut) return { state: "", reason: "timeout" }
-    if (callerAborted) return { state: "", reason: "aborted" }
-    return { state: "", reason: "network" }
+    if (timedOut) return { state: "", reason: "timeout", status: 0 }
+    if (callerAborted) return { state: "", reason: "aborted", status: 0 }
+    return { state: "", reason: "network", status: 0 }
   } finally {
     clearTimeout(timer)
     if (signal?.removeEventListener) signal.removeEventListener("abort", onAbort)

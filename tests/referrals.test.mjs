@@ -383,7 +383,7 @@ test("成功：codes 乱序时仍取最小正 slot（slot 1），并保留全部
   for (const entry of res.slots) assert.match(entry.shareUrl, new RegExp(`^${BASE.replace(/\./g, "\\.")}/r/`))
 })
 
-test("pickPrimarySlot：最小正 slot；空 / 非法 / 非正整数一律跳过", () => {
+test("pickPrimarySlot：最小正 slot；数字字符串也算（上游会给 \"1\"），空 / 非法一律跳过", () => {
   const a = { slot: 3, code: CODE_3 }
   const b = { slot: 1, code: CODE_1 }
   const c = { slot: 2, code: CODE_2 }
@@ -392,13 +392,18 @@ test("pickPrimarySlot：最小正 slot；空 / 非法 / 非正整数一律跳过
   assert.equal(pickPrimarySlot(null), null)
   assert.equal(pickPrimarySlot(undefined), null)
 
+  // ⚠ `"1"` 必须当 1：`invite-source` 的 slotOf 接受数字字符串，这里拒收就是
+  //   「码取回来了但主码选不出来」→ no_code → 白等 24 小时。
+  assert.equal(pickPrimarySlot([{ slot: "2", code: CODE_2 }]).slot, "2")
+  assert.equal(pickPrimarySlot([{ slot: 3, code: CODE_3 }, { slot: "1", code: CODE_1 }]).code, CODE_1)
+
   const invalid = [
     null,
     {},
     { slot: 0, code: CODE_1 },
     { slot: -1, code: CODE_1 },
-    { slot: "1", code: CODE_1 },
     { slot: 1.5, code: CODE_1 },
+    { slot: "1.5", code: CODE_1 },
     { slot: 1, code: "" },
     { slot: 1, code: "bad code with spaces" },
     { slot: 1, code: "bad/code" },
@@ -662,4 +667,38 @@ test("常量：端点与空 body 字面量固定", () => {
   assert.equal(REFERRAL_CODE_PATH, "/api/oauth/referrals/code")
   assert.deepEqual(REFERRAL_CODE_BODY, {})
   assert.equal(Object.isFrozen(REFERRAL_CODE_BODY), true, "空 body 必须冻结，别被调用方改出别的 canonical")
+})
+
+// ── 0.2.0 评审修复：顶层 code / 数字字符串 slot / 幂等键可固定 ─────────
+
+test("readReferralCode / fetchReferralCode：只有顶层 code（codes[] 为空）也认，不判 no_code", async () => {
+  const body = { schema_version: 1, code: CODE_1, invite_code: "ABCD-EFGH-JK23", share_url: `${BASE}/r/${CODE_1}` }
+  assert.equal(readReferralCode(body).code, CODE_1)
+
+  const { fetchImpl } = recorder({ [REFERRAL_CODE_PATH]: { body } })
+  const res = await fetchReferralCode(AUTH, { record: recordFor(), fetchImpl, now: NOW, me: { eligible: true } })
+  // 只认 codes[] 的旧实现会在这里回 no_code，然后白等 24 小时
+  assert.equal(res.ok, true)
+  assert.equal(res.code, CODE_1)
+  assert.equal(res.inviteCode, "ABCD-EFGH-JK23")
+})
+
+test("fetchReferralCode：idempotencyAt 固定幂等键（重试复用同一把键），签名时间戳仍是当前时间", async () => {
+  const record = recordFor() // 同一台设备：installationId 是幂等键的一部分
+  const { calls, fetchImpl } = recorder({
+    [REFERRAL_CODE_PATH]: { body: { schema_version: 1, codes: [slot(1, CODE_1)] } },
+  })
+  await fetchReferralCode(AUTH, { record, fetchImpl, now: NOW, idempotencyAt: NOW, me: { eligible: true } })
+  await fetchReferralCode(AUTH, { record, fetchImpl, now: NOW + 5_000, idempotencyAt: NOW, me: { eligible: true } })
+
+  const [first, second] = calls.map((c) => new Headers(c.init.headers))
+  assert.equal(first.get("idempotency-key"), second.get("idempotency-key"), "同一窗口内重试必须复用同一把键")
+  assert.match(first.get("idempotency-key"), /^referral-code:di_[A-Za-z0-9_-]+:1700000123456$/)
+  // 签名时间戳不许跟着固定：旧时间会被服务端按过期拒
+  assert.notEqual(
+    first.get("x-phanthy-proof-timestamp") ?? first.get("x-desktop-timestamp"),
+    second.get("x-phanthy-proof-timestamp") ?? second.get("x-desktop-timestamp"),
+    "签名时间戳必须取当前时间",
+  )
+
 })

@@ -229,17 +229,22 @@ test("uidFromAuthEntry：只从 entry.metadata.userId 取（trim 后非空才要
   assert.equal(uidFromAuthEntry({ metadata: { userId: UID, accountScope: "scope" } }), UID)
 })
 
-test("uidFromAuthEntry：entry.uid / org / accountId 即使长得像指纹也一律不采纳", () => {
-  assert.equal(uidFromAuthEntry({ uid: UID }), "")
+test("uidFromAuthEntry：metadata.userId 优先，其次顶层 uid（与 uidOf 同序）；org / accountId 不采纳", () => {
+  // ⚠ 必须认顶层 uid：本机真实 plugin-auth.json 里 0 条带 metadata.userId，
+  //   oauth 型的稳定身份就在本插件写的顶层 uid 上。只认 metadata.userId =
+  //   所有升级用户的「首选账号」静默失效。
+  assert.equal(uidFromAuthEntry({ uid: UID }), UID)
+  assert.equal(uidFromAuthEntry({ metadata: { userId: UID }, uid: "other" }), UID)
+  assert.equal(uidFromAuthEntry({ metadata: { userId: "" }, uid: UID }), UID)
+  assert.equal(uidFromAuthEntry({ metadata: { userId: "   " }, uid: UID }), UID)
+  assert.equal(uidFromAuthEntry({ metadata: {}, uid: UID }), UID)
+  assert.equal(uidFromAuthEntry({ metadata: null, uid: UID }), UID)
+  assert.equal(uidFromAuthEntry({ metadata: [UID], uid: UID }), UID)
+
+  // 显示名 / 宿主内部字段仍然不许当身份
   assert.equal(uidFromAuthEntry({ org: UID }), "")
   assert.equal(uidFromAuthEntry({ accountId: UID }), "")
-  assert.equal(uidFromAuthEntry({ uid: UID, org: UID, accountId: UID }), "")
-  // metadata 存在但 userId 不可用 —— 其它位置仍然不采纳（不「兜底」）
-  assert.equal(uidFromAuthEntry({ metadata: { userId: "" }, uid: UID, org: UID, accountId: UID }), "")
-  assert.equal(uidFromAuthEntry({ metadata: { userId: "   " }, uid: UID }), "")
-  assert.equal(uidFromAuthEntry({ metadata: {}, uid: UID }), "")
-  assert.equal(uidFromAuthEntry({ metadata: null, uid: UID }), "")
-  assert.equal(uidFromAuthEntry({ metadata: [UID], uid: UID }), "")
+  assert.equal(uidFromAuthEntry({ org: UID, accountId: UID }), "")
 })
 
 test("uidFromAuthEntry：非字符串 / 非对象 / 退化输入 → 空串（不抛）", () => {
@@ -408,10 +413,9 @@ test("readPreferredUid：no_auth_entry —— plugin-auth.json 缺失 / 没有�
   }
 })
 
-test("readPreferredUid：no_uid —— 条目在，但 metadata.userId 不是非空字符串", () => {
+test("readPreferredUid：no_uid —— 条目在，但既没有 metadata.userId 也没有顶层 uid", () => {
   const entries = [
-    { uid: UID, org: UID, accountId: "138****8000" },
-    { org: UID },
+    { org: UID, accountId: "138****8000" },
     { accountId: UID },
     { metadata: {} },
     { metadata: null },
@@ -428,6 +432,15 @@ test("readPreferredUid：no_uid —— 条目在，但 metadata.userId 不是非
     assert.equal(v.uid, "")
     assert.equal(v.home, "home#1")
   }
+
+  // 有顶层 uid 就是可用身份（oauth 型登录态的真实形状）
+  const dir = writeConfig(tempConfigDir(), {
+    logins: [row({ home: "home#1" })],
+    auth: { "home#1": { uid: UID, metadata: { email: "138****8000" } } },
+  })
+  const ok = readPreferredUid("phanthycode", { configDir: dir })
+  assert.equal(ok.reason, "ok")
+  assert.equal(ok.uid, UID)
 })
 
 test("readPreferredUid：bad_config —— plugin-auth.json 坏 JSON / 非对象 / 空文件", () => {

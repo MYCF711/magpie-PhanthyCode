@@ -57,12 +57,12 @@
 - `node scripts/privacy-scan.mjs`：PASS（0 处）；
 - `git diff --check`：退出 0（无空白错误）；
 - `npm pack --dry-run`：白名单为运行时 + 必要文档（见 `package.json` 的 `files`）；
-- **真实取码已验证（2026-11-09，本机生产环境）**：0.2.0 部署并重启 magpie 后，
-  该账号自己的 `usage` 钩子走完 `GET /referrals/me` → `POST /referrals/code`，
-  在 `~/.cache/magpie/phanthycode-invite-code-<uid>.json` 落下一张真实邀请码
-  （`slot: 1`，`shareUrl` 为官方 `/r/<code>` 形态）；全程零 bind、零推理请求。
-  同时 `src/preferred.mjs` 读本机 `logins.json` / `plugin-auth.json` 得到首选账号的
-  `metadata.userId`（`reason: "ok"`）——置顶开关的声明形状也已被 0.1.3371 宿主识别。
+- **真实取码的验证边界（更正）**：本机 `~/.cache/magpie` 里**没有**任何
+  `phanthycode-invite*` 文件（已装版本是 0.1.0，0.2.0 只在本地分支），所以不能写成
+  「真实取码已落盘」。另外本机 `plugin-auth.json` 的 phanthycode 条目是 **oauth 型**，
+  稳定身份在顶层 `uid`（`metadata` 只有 `email`）—— `src/preferred.mjs` 已按
+  `metadata.userId || uid` 取（与 `uidOf()` 同序），只认 `metadata.userId` 会对现有安装
+  一律返回 `no_uid`。「首选账号」与置顶开关的宿主识别仍需真机点一次再确认。
 - 本地未提交版不打 tag、不发布，因此不把 `check-maintenance.mjs` 的发布/tag 检查伪写成已通过。
 
 ## 五、下一步（按优先级）

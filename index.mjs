@@ -415,11 +415,22 @@ export const PhanthyCodeAuthPlugin = async (_ctx = {}, _options = {}) => {
             if (!source.code) return null // 没有码 = 不带邀请（零请求）
 
             // 一次 ask 只抓一次公开分享页；失败只记 reason，不阻塞登录。
-            const { state: referralState, reason } = await fetchReferralState({
+            const { state: referralState, reason, status } = await fetchReferralState({
               base: BASE,
               code: source.code,
               fetchImpl,
             })
+
+            // ⚠ 分享页明确不存在（404 / 410）时把这张码判死：否则它会一直占着
+            //   「最新账号」这一格，每次登录都拿死码去换 state —— 邀请永远不生效，
+            //   而且一句报错都没有。只认「明确不存在」，超时 / 网络抖不动码。
+            if (!referralState && (status === 404 || status === 410) && source.uid && source.kind !== "reserved") {
+              try {
+                inviteSources.dropCode(source.uid)
+              } catch {
+                // 删失败不影响登录
+              }
+            }
 
             // 只有「预留」来源才回写策略文件（用户手填 / 0 / 1 沿用）。
             // 自动派生的码**绝不**写它 —— 否则一次自动派生就把用户的兜底覆盖掉。
@@ -1426,6 +1437,9 @@ export const PhanthyCodeAuthPlugin = async (_ctx = {}, _options = {}) => {
       const now = Date.now()
       const last = inviteHarvestAttempts.get(account)
       if (last && now - last.at < INVITE_HARVEST_INTERVAL_MS) return null
+      // 冷却必须是**落盘**的：只放进程内存的话，用户重启一次 magpie 就能再打一次写面。
+      const persisted = inviteSources.readAccount(account)
+      if (persisted?.attemptedAt && now - persisted.attemptedAt < INVITE_HARVEST_INTERVAL_MS) return null
 
       // 设备没注册：跳过（不 force、不换 key、不拿别人的 token）。
       // ⚠ **不写冷却**：这次一条请求都没发，设备一注册就该立刻能采。
@@ -1438,11 +1452,33 @@ export const PhanthyCodeAuthPlugin = async (_ctx = {}, _options = {}) => {
         if (inviteSources.readCode(account)) return null
         const started = inviteHarvestAttempts.get(account)
         if (started && Date.now() - started.at < INVITE_HARVEST_INTERVAL_MS) return null
+        const alreadyTried = inviteSources.readAccount(account)
+        if (alreadyTried?.attemptedAt && Date.now() - alreadyTried.attemptedAt < INVITE_HARVEST_INTERVAL_MS) return null
 
-        inviteHarvestAttempts.set(account, { at: Date.now(), reason: "" })
+        // ⚠ 整个采集共用一个 **总预算**：`GET /referrals/me` + `POST /referrals/code`
+        //   各 2 秒的话最坏是 4 秒，而 usage()/checkin() 都是 await 它的。
+        //   一个 signal 贯穿两请求 = 总共 2 秒封顶。
+        const budget = AbortSignal.timeout(INVITE_HARVEST_TIMEOUT_MS)
+        // 幂等键按「同一 24h 窗口」固定：失败重试要复用同一把键，否则超时后重发
+        // 会被上游当成新请求（可能再消耗一个名额）。签名时间戳仍用当前时间。
+        const attemptAt = Date.now()
+        const idempotencyAt = persisted?.attemptedAt && attemptAt - persisted.attemptedAt < INVITE_HARVEST_INTERVAL_MS
+          ? persisted.attemptedAt
+          : Math.floor(attemptAt / 86_400_000) * 86_400_000
+
+        inviteHarvestAttempts.set(account, { at: attemptAt, reason: "" })
+        try {
+          inviteSources.markAttempt({ uid: account, at: attemptAt, reason: "" })
+        } catch {
+          // 写失败不影响主流程
+        }
         try {
           // ① 只读资格：没资格就不写（绝不伪造奖励）
-          const me = await fetchReferralMe(auth, { fetchImpl, timeout: INVITE_HARVEST_TIMEOUT_MS })
+          const me = await fetchReferralMe(auth, {
+            fetchImpl,
+            signal: budget,
+            timeout: INVITE_HARVEST_TIMEOUT_MS,
+          })
           if (!me.ok) {
             inviteHarvestAttempts.set(account, { at: Date.now(), reason: me.reason || "failed" })
             return null
@@ -1463,12 +1499,19 @@ export const PhanthyCodeAuthPlugin = async (_ctx = {}, _options = {}) => {
           const result = await fetchReferralCode(auth, {
             record,
             fetchImpl,
+            signal: budget,
+            idempotencyAt,
             me: me.me,
             timeout: INVITE_HARVEST_TIMEOUT_MS,
           })
           if (!result.ok) {
             const reason = result.reason === "failed" ? result.failure : result.reason
             inviteHarvestAttempts.set(account, { at: Date.now(), reason: String(reason ?? "failed") })
+            try {
+              inviteSources.markAttempt({ uid: account, at: attemptAt, reason: String(reason ?? "failed") })
+            } catch {
+              // 写失败不影响主流程
+            }
             if (result.reason === "ineligible") {
               try {
                 inviteSources.markEligibility({
@@ -1483,12 +1526,23 @@ export const PhanthyCodeAuthPlugin = async (_ctx = {}, _options = {}) => {
             return null
           }
 
-          inviteSources.saveCode({
+          // ⚠ saveCode 会拒绝「形状不合格」的码并返回 null。**必须先看返回值**：
+          //   忽略它就会出现「采集记为成功、磁盘上一个字节都没有」的静默失效。
+          const saved = inviteSources.saveCode({
             uid: account,
             code: result.code,
             shareUrl: result.shareUrl,
             slot: result.slot,
           })
+          if (!saved) {
+            inviteHarvestAttempts.set(account, { at: Date.now(), reason: "unsaveable" })
+            try {
+              inviteSources.markAttempt({ uid: account, at: attemptAt, reason: "unsaveable" })
+            } catch {
+              // 写失败不影响主流程
+            }
+            return null
+          }
           try {
             inviteSources.markEligibility({ uid: account, eligible: true, reason: "" })
           } catch {
@@ -1498,6 +1552,11 @@ export const PhanthyCodeAuthPlugin = async (_ctx = {}, _options = {}) => {
           return result
         } catch {
           inviteHarvestAttempts.set(account, { at: Date.now(), reason: "error" })
+          try {
+            inviteSources.markAttempt({ uid: account, at: attemptAt, reason: "error" })
+          } catch {
+            // 写失败不影响主流程
+          }
           return null
         }
       })

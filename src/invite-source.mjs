@@ -40,12 +40,13 @@
 //      多传的键一律丢掉（不是「存下来但不用」，是根本不落盘）。
 //   ⑤ 所有读失败（文件不在、坏 JSON、坏码）一律当「没有」，**不抛**；写失败不影响主流程。
 //      `writeJson` 自带独立临时名 + 0600 + 原子 rename（`src/store.mjs`）。
-//   ⑥ 码白名单 `^[A-Za-z0-9._-]{1,200}$`（与 `src/invite.mjs` 的 `referralShareUrl` 同一口径）。
-//      另外挡住三类「形状对但不能用」的东西：
-//        · 短 `invite_code`（`abcd-efgh-jk23` 这种人类可读码）——塞进 `/r/` 只会 404，
-//          属于**静默失效**；它只能在注册表单里手填。
+//   ⑥ 码白名单 `^[A-Za-z0-9._-]{1,200}$`（与 `src/invite.mjs` 的 `referralShareUrl`、
+//      `src/referrals.mjs` 的 `REFERRAL_CODE_RE` 同一口径，**形状只判这一次**）。
+//      另外挡住两类「形状对但不能用」的东西：
 //        · `referral_state`（`rs1.…`）—— 按链接即时签发的短期令牌，不是邀请码。
 //        · 凭据形状（JWT / `di_…` 安装 id / `Bearer …` / `sk-…`）—— 一律不当作邀请码。
+//      人类可读的短 `invite_code` **不再按形状拒绝**：上游取码接口回的码形状不保证，
+//      两层判定分叉会变成「采集成功但磁盘上没有码」的静默失效（见 INVITE_CODE_RE 注释）。
 
 import { createHash } from "node:crypto"
 import { homedir } from "node:os"
@@ -54,9 +55,18 @@ import { join } from "node:path"
 import { BASE } from "./context.mjs"
 import { referralShareUrl } from "./invite.mjs"
 import { assertTrustedUrl } from "./origin.mjs"
-import { readJson, writeJson } from "./store.mjs"
+import { readJson, removeJson, writeJson } from "./store.mjs"
 
-/** 邀请码白名单（与 `src/invite.mjs` 的 `referralShareUrl` 逐字一致） */
+/**
+ * 邀请码形状。
+ *
+ * ⚠ **只有这一层判定**：码的形状必须与 `src/referrals.mjs`（`REFERRAL_CODE_RE`）和
+ *   `src/invite.mjs` 的 `referralShareUrl` 同一口径。曾经这里额外拒绝「短 `invite_code`」
+ *   （`^[A-Za-z0-9]{2,6}(?:-[A-Za-z0-9]{2,6}){2,}$`），结果上游取码接口回一张
+ *   `AB12-CD34-EF56` 形状的码时：`referrals` 收下、`/r/<code>` 也拼得出来，
+ *   但 `saveCode()` 悄悄返回 null —— 采集记为成功、磁盘上什么都没有，自动模式报
+ *   「没有任何账号的邀请链接」。**形状只判一次**，判不了就交给 `/r/` 的真实结果。
+ */
 export const INVITE_CODE_RE = /^[A-Za-z0-9._-]{1,200}$/
 
 /**
@@ -102,12 +112,6 @@ const PREFIX_RE = /^[A-Za-z0-9._-]{1,40}$/
 
 /** `/r/<code>`（可省前导 `/`，容忍尾斜杠；query / hash 在匹配前已切掉） */
 const SHARE_PATH_RE = /^\/?r\/([^/?#]+)\/?$/i
-
-/**
- * 人类可读的短 `invite_code` 形状：≥3 段、每段 2~6 位字母数字（`ABCD-EFGH-JK23`）。
- * 长码（`EXAMPLE1CODE-XXXX…`）只有 1~2 段，不会命中。
- */
-const SHORT_INVITE_RE = /^[A-Za-z0-9]{2,6}(?:-[A-Za-z0-9]{2,6}){2,}$/
 
 /** 凭据 / 状态令牌形状：即使过了字符白名单，也绝不当作邀请码 */
 const CREDENTIAL_RES = [
@@ -172,7 +176,6 @@ function reject(reason) {
 function problemOf(code) {
   if (!code) return R.empty
   for (const re of CREDENTIAL_RES) if (re.test(code)) return R.credential
-  if (SHORT_INVITE_RE.test(code)) return R.shortInviteCode
   if (!INVITE_CODE_RE.test(code)) return R.invalidCode
   // `...` / `---` 这类退化输入也在白名单字符集里，但它们不可能是码
   if (!/[A-Za-z0-9]/.test(code)) return R.invalidCode
@@ -337,6 +340,14 @@ export function createInviteSourceStore(prefix = DEFAULT_PREFIX) {
       if (typeof entry.eligible === "boolean") item.eligible = entry.eligible
       const reason = textOf(entry.reason)
       if (reason) item.reason = reason
+      // 采集冷却：**落盘**，不能只放进程内存 —— 重启一次就忘了，
+      // 「每账号 24h 至多一次」就成了「每进程至多一次」。
+      // 没有尝试过就**不写这个键**（`markEligibility` 会 `{...prev}` 回写，
+      // 凭空造一个 0 会把「白名单字段」污染成 `attemptedAt: 0`）。
+      const attemptedAt = stampOrZero(entry.attemptedAt)
+      if (attemptedAt) item.attemptedAt = attemptedAt
+      const attemptReason = textOf(entry.attemptReason)
+      if (attemptReason) item.attemptReason = attemptReason
       out[key] = item
     }
     return out
@@ -373,6 +384,8 @@ export function createInviteSourceStore(prefix = DEFAULT_PREFIX) {
     }
     if (prev && typeof prev.eligible === "boolean") entry.eligible = prev.eligible
     if (prev?.reason) entry.reason = prev.reason
+    if (prev?.attemptedAt) entry.attemptedAt = prev.attemptedAt
+    if (prev?.attemptReason) entry.attemptReason = prev.attemptReason
 
     accounts[key] = entry
     writeJson(indexFile, accounts) // 写失败不影响主流程（规矩 ⑤）
@@ -405,6 +418,53 @@ export function createInviteSourceStore(prefix = DEFAULT_PREFIX) {
     accounts[key] = next
     writeJson(indexFile, accounts)
     return { uid: key, ...next }
+  }
+
+  /**
+   * 记一次「采集尝试」（时间 + 原因），**落盘**。
+   *
+   * 为什么要落盘：`POST /referrals/code` 是写面（会消耗名额），冷却只放进程内存的话，
+   * 用户每重启一次 magpie 就能再打一次。另外幂等键要按同一个窗口固定，
+   * 调用方需要读回上次的 `attemptedAt` 来复用。
+   *
+   * @returns {object | null} 更新后的条目；账号没见过的 uid 返回 null
+   */
+  function markAttempt({ uid, at, reason } = {}) {
+    const key = textOf(uid)
+    if (!key) return null
+
+    const accounts = readAccounts()
+    const prev = accounts[key]
+    if (!prev) return null
+
+    const next = { ...prev, attemptedAt: timeOf(at) }
+    const text = textOf(reason)
+    if (text) next.attemptReason = text
+    else delete next.attemptReason
+
+    accounts[key] = next
+    writeJson(indexFile, accounts)
+    return { uid: key, ...next }
+  }
+
+  /**
+   * 把这个账号的码判死（删掉码文件）。
+   *
+   * 触发点：`/r/<code>` 明确回 404/410（分享页已经不存在）。不清掉的话，
+   * 它会一直占着「最新账号」这一格，每次登录都拿一张死码去换 state ——
+   * 邀请永远不生效，而且没有任何报错。
+   *
+   * @returns {boolean} 真的删掉了才返回 true
+   */
+  function dropCode(uid) {
+    const key = textOf(uid)
+    if (!key) return false
+    const file = codeFile(key)
+    if (!file) return false
+    // 「真的删掉了才 true」：removeJson 对不存在的文件也返回成功，先读一次再删。
+    if (readJson(file, null) === null) return false
+    removeJson(file)
+    return true
   }
 
   // ── 每账号的码 ────────────────────────────────────────────────────
@@ -583,9 +643,11 @@ export function createInviteSourceStore(prefix = DEFAULT_PREFIX) {
     readAccount,
     noteAccount,
     markEligibility,
+    markAttempt,
     // 每账号的码
     readCode,
     saveCode,
+    dropCode,
     // 选择
     resolve,
   }

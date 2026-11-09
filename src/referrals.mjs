@@ -108,6 +108,21 @@ function nowMs(now) {
   return Math.trunc(ms)
 }
 
+/**
+ * slot 归一：上游可能给数字，也可能给 `"1"` 这种数字字符串。
+ *
+ * ⚠ 只认 `Number.isInteger` 会把 `"1"` 整个丢掉 —— 而 `invite-source.mjs` 的
+ *   `slotOf` 又接受数字字符串，两层判定分叉的结果是「码取回来了但主码选不出来」。
+ */
+function slotOf(value) {
+  if (Number.isInteger(value) && value > 0) return value
+  if (typeof value === "string" && /^\d{1,9}$/.test(value.trim())) {
+    const n = Number(value.trim())
+    return Number.isInteger(n) && n > 0 ? n : null
+  }
+  return null
+}
+
 /** 由 code 派生分享页 URL；非法 code 返回空串（不抛）。 */
 function derivedShareUrlOf(code) {
   try {
@@ -197,8 +212,8 @@ export function readReferralMe(body) {
 /** 一个 slot（字段白名单；code 不合法就整条丢掉，别缓存一条用不了的）。 */
 function readSlot(entry) {
   if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null
-  const slot = entry.slot
-  if (!Number.isInteger(slot) || slot <= 0) return null
+  const slot = slotOf(entry.slot)
+  if (slot === null) return null
   const code = normalizeReferralCode(entry.code)
   if (!code) return null
   return {
@@ -246,11 +261,16 @@ export function readReferralCode(body) {
 export function pickPrimarySlot(codes) {
   if (!Array.isArray(codes)) return null
   let best = null
+  let bestSlot = Infinity
   for (const entry of codes) {
     if (!entry || typeof entry !== "object") continue
-    if (!Number.isInteger(entry.slot) || entry.slot <= 0) continue
+    const slot = slotOf(entry.slot)
+    if (slot === null) continue
     if (!normalizeReferralCode(entry.code)) continue
-    if (best === null || entry.slot < best.slot) best = entry
+    if (slot < bestSlot) {
+      best = entry
+      bestSlot = slot
+    }
   }
   return best
 }
@@ -402,7 +422,7 @@ export async function fetchReferralMe(auth, { fetchImpl, signal, timeout = REFER
  */
 export async function fetchReferralCode(
   auth,
-  { record, fetchImpl, signal, now, nonce, timeout = REFERRAL_TIMEOUT_MS, me: providedMe } = {},
+  { record, fetchImpl, signal, now, idempotencyAt, nonce, timeout = REFERRAL_TIMEOUT_MS, me: providedMe } = {},
 ) {
   // ① 本地判据：设备没注册就一条请求都不发（更不能 POST）
   if (!isDeviceRegistered(record)) return { ok: false, reason: "device_required" }
@@ -434,10 +454,17 @@ export async function fetchReferralCode(
   }
 
   // ④ 签名 + 幂等键：body 必须是字面量 `{}`（canonical 的第 6 段是它的 sha256）
+  //
+  // ⚠ 幂等键与签名时间戳必须分开：
+  //   · 幂等键含 `<ms>`，若每次重试都取当前时间，超时后重试就是**一把新键** ——
+  //     上游会当成新请求，可能再消耗一个名额（「重试不幂等」）。
+  //     所以调用方可以传 `idempotencyAt`（同一个 24h 窗口内固定），这里只影响键。
+  //   · 签名时间戳必须是**当前时间**（旧时间会被服务端按过期拒），仍取 `now`。
   let idempotencyKey
   let privateKey
   try {
-    idempotencyKey = referralCodeIdempotencyKey(record.installationId, at)
+    const keyAt = idempotencyAt === undefined ? at : nowMs(idempotencyAt)
+    idempotencyKey = referralCodeIdempotencyKey(record.installationId, keyAt)
     privateKey = identityPrivateKey(record)
   } catch {
     return { ok: false, reason: "failed", failure: "internal", status: 0 }
@@ -466,7 +493,13 @@ export async function fetchReferralCode(
   }
 
   const parsed = readReferralCode(body)
-  const primary = pickPrimarySlot(parsed.slots)
+  // ⚠ 上游两种形状都要认：`codes[]` 里挑主码；只有顶层 `code` 时把它当主码。
+  //   只认 `codes[]` 的后果是「码在响应里、我们却判 no_code」，然后白等 24 小时。
+  const primary =
+    pickPrimarySlot(parsed.slots) ??
+    (parsed.code
+      ? { slot: 1, code: parsed.code, inviteCode: parsed.inviteCode, shareUrl: parsed.shareUrl }
+      : null)
   if (!primary) return { ok: false, reason: "failed", failure: "no_code", status: 200 }
 
   // 顶层 share_url 优先（仅当它对应的就是主码）；否则用该 slot 自己的（已过 origin）

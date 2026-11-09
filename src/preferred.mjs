@@ -153,19 +153,27 @@ export function pickPreferredRow(loginsRows, provider) {
 }
 
 /**
- * 从 `plugin-auth.json` 的一条记录里取稳定身份（`metadata.userId`）。
+ * 从 `plugin-auth.json` 的一条记录里取稳定身份。
  *
- * 只认 `entry.metadata.userId` 的非空字符串（两端空白去掉）。`entry.uid` /
- * `entry.org` / `entry.accountId` **一律不采纳** —— 它们是宿主内部字段或
- * 显示名，不是 `fingerprint(accountScope)`；拿来当键 = 换 token / 改名后换人。
+ * 顺序与 `src/credential.mjs` 的 `uidOf()` **一致**：`metadata.userId` 优先，
+ * 其次是顶层 `uid`。
+ *
+ * ⚠ 为什么必须回退 `entry.uid`：本机真实 `plugin-auth.json` 里 **0 条**带
+ *   `metadata.userId` —— oauth 型登录态只有 `metadata.email`，稳定身份在本插件
+ *   自己写的顶层 `uid`（= `fingerprint(accountScope)`）。只认 `metadata.userId`
+ *   会让所有升级用户的「首选账号」静默失效（reason=no_uid），而且原因文案还是错的。
+ *   `entry.accountId` / `entry.org` 仍然不采纳 —— 它们是显示名 / 宿主内部字段。
  *
  * @param {unknown} entry `plugin-auth.json` 的条目
  * @returns {string} 稳定 uid；取不到时 `""`（**不抛**）
  */
 export function uidFromAuthEntry(entry) {
   if (!isRecord(entry)) return ""
-  if (!isRecord(entry.metadata)) return ""
-  return textOf(entry.metadata.userId)
+  if (isRecord(entry.metadata)) {
+    const fromMetadata = textOf(entry.metadata.userId)
+    if (fromMetadata) return fromMetadata
+  }
+  return textOf(entry.uid)
 }
 
 /**

@@ -176,7 +176,7 @@ test("C5 合法 code：仅一次匿名 GET，官方 UA / Accept / redirect:manua
   const fetchImpl = mockFetch()
   const out = await fetchReferralState({ base: BASE, code: "ABC-123_xyz", fetchImpl })
 
-  assert.deepEqual(out, { state: "rs1.abc.DEF-123", reason: "" })
+  assert.deepEqual(out, { state: "rs1.abc.DEF-123", reason: "", status: 200 })
   assert.equal(fetchImpl.calls.length, 1)
   const [{ url, init }] = fetchImpl.calls
 
@@ -200,7 +200,7 @@ test("C5 非法 / 空 code：零 fetch，返回 invalid_code", async () => {
   const fetchImpl = mockFetch()
   for (const code of ["", "   ", undefined, null, "../evil", "a/b", "a b", "a\nb", "x".repeat(201)]) {
     const out = await fetchReferralState({ base: BASE, code, fetchImpl })
-    assert.deepEqual(out, { state: "", reason: "invalid_code" }, `code=${JSON.stringify(code)}`)
+    assert.deepEqual(out, { state: "", reason: "invalid_code", status: 0 }, `code=${JSON.stringify(code)}`)
   }
   assert.equal(fetchImpl.calls.length, 0)
 })
@@ -208,7 +208,7 @@ test("C5 非法 / 空 code：零 fetch，返回 invalid_code", async () => {
 test("C5 不可信 base：零 fetch，返回 untrusted_origin", async () => {
   const fetchImpl = mockFetch()
   const out = await fetchReferralState({ base: "https://evil.example", code: "ABC", fetchImpl })
-  assert.deepEqual(out, { state: "", reason: "untrusted_origin" })
+  assert.deepEqual(out, { state: "", reason: "untrusted_origin", status: 0 })
   assert.equal(fetchImpl.calls.length, 0)
 })
 
@@ -216,16 +216,18 @@ test("C5 不可信 base：零 fetch，返回 untrusted_origin", async () => {
 
 test("C6 非 2xx / 3xx / 无 state / 网络错误都返回 {state:'',reason}，不抛", async () => {
   const cases = [
-    [{ status: 500, body: "boom" }, "http_error"],
-    [{ status: 404, body: "not found" }, "http_error"],
-    [{ status: 302, body: "", headers: { location: `${BASE}/login` } }, "redirect"],
-    [{ status: 200, body: "<html>没有链接</html>" }, "no_state"],
-    [{ status: 200, body: '<a href="/login?referral_state=bad">x</a>' }, "no_state"],
+    [{ status: 500, body: "boom" }, "http_error", 500],
+    [{ status: 404, body: "not found" }, "http_error", 404],
+    [{ status: 302, body: "", headers: { location: `${BASE}/login` } }, "redirect", 302],
+    [{ status: 200, body: "<html>没有链接</html>" }, "no_state", 200],
+    [{ status: 200, body: '<a href="/login?referral_state=bad">x</a>' }, "no_state", 200],
   ]
-  for (const [opts, reason] of cases) {
+  for (const [opts, reason, status] of cases) {
     const fetchImpl = mockFetch(opts)
     const out = await fetchReferralState({ base: BASE, code: "ABC", fetchImpl })
-    assert.deepEqual(out, { state: "", reason }, `status=${opts.status}`)
+    // status 让调用方区分「码被上游判死（404/410）」与「临时故障」——
+    // 前者要清掉这张死码，后者不许动。
+    assert.deepEqual(out, { state: "", reason, status }, `status=${opts.status}`)
     assert.equal(fetchImpl.calls.length, 1)
   }
 
@@ -235,6 +237,7 @@ test("C6 非 2xx / 3xx / 无 state / 网络错误都返回 {state:'',reason}，�
   assert.deepEqual(await fetchReferralState({ base: BASE, code: "ABC", fetchImpl: throwing }), {
     state: "",
     reason: "network",
+    status: 0,
   })
 })
 
@@ -251,7 +254,7 @@ test("C6 10s 超时：返回 timeout（不阻塞登录）", async (t) => {
   t.mock.timers.tick(INVITE_FETCH_TIMEOUT_MS)
   const out = await pending
 
-  assert.deepEqual(out, { state: "", reason: "timeout" })
+  assert.deepEqual(out, { state: "", reason: "timeout", status: 0 })
   assert.equal(calls, 1)
 })
 
@@ -267,6 +270,7 @@ test("C6 调用方 signal：可合并、可取消；已取消则零 fetch", asyn
   assert.deepEqual(await fetchReferralState({ base: BASE, code: "ABC", fetchImpl: never, signal: pre.signal }), {
     state: "",
     reason: "aborted",
+    status: 0,
   })
   assert.equal(calls, 0)
 
@@ -280,7 +284,7 @@ test("C6 调用方 signal：可合并、可取消；已取消则零 fetch", asyn
   }
   const pending = fetchReferralState({ base: BASE, code: "ABC", fetchImpl: hung, signal: ac.signal })
   ac.abort()
-  assert.deepEqual(await pending, { state: "", reason: "aborted" })
+  assert.deepEqual(await pending, { state: "", reason: "aborted", status: 0 })
   assert.equal(calls, 1)
 })
 
@@ -357,7 +361,7 @@ test("C15 失败结果与错误文案不回显 state / code 原值", async () =>
   const html = `<a href="/login?referral_state=${encodeURIComponent(secretState + " ")}">x</a>`
   const fetchImpl = mockFetch({ body: html })
   const out = await fetchReferralState({ base: BASE, code: "SAFE-CODE", fetchImpl })
-  assert.deepEqual(out, { state: "", reason: "no_state" })
+  assert.deepEqual(out, { state: "", reason: "no_state", status: 200 })
   assert.doesNotMatch(JSON.stringify(out), /credential-looking/)
 
   // 非法 code 的错误文案不含原值

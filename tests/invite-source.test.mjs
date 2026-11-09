@@ -84,12 +84,19 @@ test("parseInviteShareCode：别的 origin / 非 https / 协议相对 / userinfo
   }
 })
 
-test("parseInviteShareCode：短 invite_code / 凭据 / state 形状一律拒绝（不许拿它造 /r/ 链接）", () => {
+test("parseInviteShareCode：短码不再按形状拒绝（形状只判一次）/ 凭据与 state 一律拒绝", () => {
+  // ⚠ 以前这里会把「人类可读短码」按形状拒掉；那套判定和 `referrals` / `referralShareUrl`
+  //   分叉，导致上游回一张 `AB12-CD34-EF56` 形状的码时「采集成功、磁盘上没有码」。
+  //   现在形状只判一次（与 referrals 同一口径），可用性交给 `/r/` 的真实结果。
+  for (const code of ["abcd-efgh-jk23", "ABCD-EFGH-JK23", "AB-CD-EF"]) {
+    const v = parseInviteShareCode(code)
+    assert.equal(v.ok, true, `应当接受：${code}`)
+    assert.equal(v.code, code)
+    assert.equal(v.reason, "")
+    assert.ok(v.shareUrl.endsWith(`/r/${code}`), "shareUrl 由 code 派生")
+  }
+
   const cases = [
-    // 人类可读邀请码（注册表单里手填那种）：塞进 /r/ 只会 404，属于静默失效
-    ["abcd-efgh-jk23", "short_invite_code"],
-    ["ABCD-EFGH-JK23", "short_invite_code"],
-    ["AB-CD-EF", "short_invite_code"],
     // referral_state：按链接即时签发的短期令牌，不是邀请码
     ["rs1.AAAA.BBBB", "credential"],
     // JWT：三段点分。运行时拼接 —— 公开仓库里不留「看起来像真凭据」的字面量，
@@ -300,9 +307,14 @@ test("resolve：什么都没有 → 空（不抛、不造码），off 时才落�
   assert.equal(v.uid, "")
 })
 
-test("resolve：预留值是短 invite_code / 非法 → 不当作源，且说明原因", () => {
+test("resolve：短码可当预留源（形状只判一次）；别的 origin / 空格仍然 reserved_unusable", () => {
   const s = createInviteSourceStore("zzsrc-reserved-bad")
-  for (const bad of ["abcd-efgh-jk23", "https://evil.example.com/r/abc123", "abc def"]) {
+  // 短码现在是合法码（与 referrals 同一口径）
+  const ok = s.resolve({ preferFirst: false, reservedCode: "abcd-efgh-jk23" })
+  assert.equal(ok.kind, "reserved")
+  assert.equal(ok.code, "abcd-efgh-jk23")
+
+  for (const bad of ["https://evil.example.com/r/abc123", "abc def"]) {
     const v = s.resolve({ preferFirst: false, reservedCode: bad })
     assert.equal(v.kind, "none", `不许用：${bad}`)
     assert.equal(v.code, "")
@@ -439,7 +451,9 @@ test("saveCode：空码 / 非法码 / 短码绝不覆盖旧值（空值不写是
 
   assert.equal(s.saveCode({ uid: "u1", code: "", at: 2_000 }), null)
   assert.equal(s.saveCode({ uid: "u1", code: "   ", at: 3_000 }), null)
-  assert.equal(s.saveCode({ uid: "u1", code: "abcd-efgh-jk23", at: 4_000 }), null)
+  // 短码现在是合法码（形状只判一次），但仍不许用它覆盖已有的好码吗？允许覆盖 —— 它就是一张码。
+  assert.equal(s.saveCode({ uid: "u1", code: "abcd-efgh-jk23", at: 4_000 }).code, "abcd-efgh-jk23")
+  s.saveCode({ uid: "u1", code: CODE_A, at: 4_500 })
   assert.equal(s.saveCode({ uid: "u1", code: "rs1.x", at: 5_000 }), null)
 
   assert.equal(s.readCode("u1").code, CODE_A)
@@ -470,7 +484,8 @@ test("readCode / readAccounts：坏 JSON、坏码、坏索引都当没有，不�
   writeFileSync(s.codeFile("u1"), "{not json")
   assert.equal(s.readCode("u1"), null)
 
-  writeFileSync(s.codeFile("u2"), JSON.stringify({ code: "abcd-efgh-jk23", at: 1 }))
+  // 短码不再算坏码；真正坏的是凭据形状与非法字符
+  writeFileSync(s.codeFile("u2"), JSON.stringify({ code: "rs1.SECRET", at: 1 }))
   assert.equal(s.readCode("u2"), null)
 
   writeFileSync(s.indexFile, "[1,2,3]")
@@ -574,4 +589,40 @@ test("preferredHome 的返回值可以直接喂给 resolve（home 只是入口�
   const v = s.resolve({ preferFirst: true, preferredUid: "uid-from-home" })
   assert.equal(v.kind, "preferred")
   assert.equal(v.code, CODE_A)
+})
+
+// ═══════════════════════════════════════════════════════════════════
+// 8. 采集冷却落盘 / 死码清理（0.2.0 评审 M3 / M4）
+// ═══════════════════════════════════════════════════════════════════
+
+test("markAttempt：冷却时间落盘（重启进程也生效），readAccount 读得回", () => {
+  const s = createInviteSourceStore("zzsrc-attempt")
+  s.noteAccount({ uid: "u1", accountScope: "scope-1", accountId: "a1", at: 1_000 })
+  assert.equal(s.readAccount("u1").attemptedAt, undefined, "没尝试过就不许有这个键")
+
+  s.markAttempt({ uid: "u1", at: 5_000, reason: "timeout" })
+  const v = s.readAccount("u1")
+  assert.equal(v.attemptedAt, 5_000)
+  assert.equal(v.attemptReason, "timeout")
+  // 冷却只放内存的话，重启一次 magpie 就能再打一次写面
+  assert.equal(JSON.parse(textOf(s.indexFile)).u1.attemptedAt, 5_000)
+
+  // 没见过的账号不许凭空造
+  assert.equal(s.markAttempt({ uid: "ghost", at: 5_000 }), null)
+})
+
+test("dropCode：分享页 404 判死后删码，自动源退回上一个有码的账号（不无限重试死码）", () => {
+  const s = createInviteSourceStore("zzsrc-drop")
+  s.noteAccount({ uid: "old", accountScope: "s-old", accountId: "a-old", at: 1_000 })
+  s.saveCode({ uid: "old", code: CODE_A, at: 1_000 })
+  s.noteAccount({ uid: "new", accountScope: "s-new", accountId: "a-new", at: 2_000 })
+  s.saveCode({ uid: "new", code: CODE_B, at: 2_000 })
+
+  // 「最新注册」是 new；它的码被判死后必须退回 old
+  assert.equal(s.resolve({ preferFirst: false }).uid, "new")
+  assert.equal(s.dropCode("new"), true)
+  const v = s.resolve({ preferFirst: false })
+  assert.equal(v.uid, "old")
+  assert.equal(v.code, CODE_A)
+  assert.equal(s.dropCode("new"), false, "重复删不许抛")
 })
