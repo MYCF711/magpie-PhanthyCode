@@ -90,6 +90,8 @@ test("换票：POST 到 /oauth/token，content-type 是 form，响应归一成�
   assert.equal(calls.length, 1)
   assert.equal(calls[0].url, `${BASE}${TOKEN_PATH}`)
   assert.equal(calls[0].init.method, "POST")
+  // L-5：换票是带 refresh_token / code 的写入面，绝不能自动跟随 3xx 到别的站点
+  assert.equal(calls[0].init.redirect, "manual")
   assert.match(String(calls[0].init.headers["content-type"]), /application\/x-www-form-urlencoded/)
   assert.match(String(calls[0].init.body), /grant_type=authorization_code/)
   assert.match(String(calls[0].init.body), /code_verifier=verifier-test/)
@@ -106,6 +108,7 @@ test("续期：grant_type=refresh_token，响应没有新 refresh 时返回空�
 
   assert.match(String(calls[0].init.body), /grant_type=refresh_token/)
   assert.match(String(calls[0].init.body), /refresh_token=refresh-test/)
+  assert.equal(calls[0].init.redirect, "manual", "续期同样不许自动跟随 3xx")
   assert.equal(token.access, "access-2")
   assert.equal(token.refresh, "", "缺 refresh_token 时不能编一个值")
   assert.equal(token.expiresIn, 1800, "缺 expires_in 时按官方默认 30 分钟")

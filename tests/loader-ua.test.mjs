@@ -92,6 +92,7 @@ test("宿主注入的 user-agent 不会透传给上游：上游只看到官方�
 
   assert.equal(res.status, 200)
   assert.equal(calls.length, 1)
+  assert.equal(calls[0].init.redirect, "manual", "带签名头的请求不得自动跟随跨站重定向")
   const sent = calls[0].init.headers
   assert.equal(sent["user-agent"], OFFICIAL_UA, "官方 UA 必须覆盖宿主的 magpie/<ver>")
   assert.ok(!String(sent["user-agent"]).startsWith("magpie"))
@@ -193,6 +194,34 @@ test("真·登录失效的 401 不加 kept —— 否则这个账号永远刷新
   const res = await loader.fetch("https://code.phanthy.com/v1/messages", { method: "POST", body: "{}" })
   assert.equal(res.status, 401)
   assert.equal(res.headers.get("x-magpie-sign-in"), null)
+})
+
+// L-7：withSignInHint 用 `res.clone().text()` 解出**明文**后重建 Response。
+// 如果照抄上游的 content-encoding: gzip，下游会再解一次 gzip 而爆错；
+// content-length 也已经是明文的长度，必须交给运行时重算。
+test("withSignInHint 重建 Response：content-encoding / content-length 必须删掉，正文仍是明文", async () => {
+  const body = JSON.stringify({ error: { message: "model is not enabled for this account" } })
+  const { fetchImpl } = recorder(
+    () =>
+      new Response(body, {
+        status: 401,
+        headers: {
+          "content-type": "application/json",
+          // 上游（经网关）真会带这两个头
+          "content-encoding": "gzip",
+          "content-length": String(Buffer.byteLength(body)),
+        },
+      }),
+  )
+  const loader = await loaderWith(fetchImpl, "acct-sign-in-hint-headers")
+
+  const res = await loader.fetch("https://code.phanthy.com/v1/messages", { method: "POST", body: "{}" })
+
+  assert.equal(res.status, 401)
+  assert.equal(res.headers.get("x-magpie-sign-in"), "kept")
+  assert.equal(res.headers.get("content-encoding"), null, "重建后的正文是明文，不能带 gzip 头")
+  assert.equal(res.headers.get("content-length"), null, "长度已变，必须交给运行时重算")
+  assert.equal(await res.text(), body, "正文必须原样可读（R7）")
 })
 
 test("超时 → 504 upstream_timeout，而不是把裸 TimeoutError 扔进聊天通道", async () => {

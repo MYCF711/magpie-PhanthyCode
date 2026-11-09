@@ -22,7 +22,10 @@ const CATALOG = {
   default_model: "phanthy-fast",
   models: [
     { id: "phanthy-fast", label: "Phanthy Fast", context_window_tokens: 128000, pricing: { input_credits_per_million_tokens: 1, output_credits_per_million_tokens: 2 } },
-    { id: "phanthy-pro", label: "Phanthy Pro", context_window_tokens: 200000, capabilities: { effort: true } },
+    // 价格三态契约（src/catalog.mjs 的 creditsOf）：单条缺价 = 不列，所以夹具必须给厂商真实价
+    // （1000 积分 → 0.33x，真值见 tests/rate.test.mjs 的 INPUT_CREDITS）。
+    { id: "phanthy-pro", label: "Phanthy Pro", context_window_tokens: 200000, capabilities: { effort: true },
+      pricing: { input_credits_per_million_tokens: 1000, output_credits_per_million_tokens: 5000 } },
   ],
 }
 

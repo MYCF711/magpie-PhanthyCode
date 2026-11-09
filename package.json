@@ -1,6 +1,6 @@
 {
   "name": "magpie-phanthycode",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "magpie 插件：用 PhanthyCode 账号直连 code.phanthy.com 的模型目录、积分额度与设备密钥签名（不需要桌面端）",
   "type": "module",
   "main": "./index.mjs",

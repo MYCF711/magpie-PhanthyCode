@@ -7,6 +7,8 @@ import {
   metadataOf,
   credentialKindOf,
   uidOf,
+  metadataWithIdentity,
+  accountScopeOf,
 } from "../src/credential.mjs"
 
 test("rawCredentialOf 逐候选 trim，按 access → key → token 选首个非空值", () => {
@@ -111,4 +113,35 @@ test("uidOf 支持 refresh-only，并优先用更稳定的 refresh 指纹", () =
     uidOf({ type: "oauth", access: "rotating-access", refresh: "stable-refresh" }),
     fingerprint("stable-refresh"),
   )
+})
+
+test("metadataWithIdentity：稳定身份只写 metadata，且是合并而不是替换", () => {
+  const auth = { metadata: { email: "旧名字", userId: "old-uid", accountScope: "old-scope", kind: "api" } }
+
+  const merged = metadataWithIdentity(auth, { accountId: "新名字", uid: "new-uid", accountScope: "new-scope" })
+  assert.deepEqual(merged, { email: "新名字", userId: "new-uid", accountScope: "new-scope", kind: "api" })
+
+  // 只给一部分值（refresh 补名字）时，其余稳定身份必须保留
+  const kept = metadataWithIdentity(auth, { accountId: "新名字" })
+  assert.equal(kept.userId, "old-uid")
+  assert.equal(kept.accountScope, "old-scope")
+  assert.equal(kept.kind, "api")
+
+  // 登录（没有旧登录态）+ 全空 → 空对象（不能写 undefined / 空串）
+  assert.deepEqual(metadataWithIdentity(undefined, {}), {})
+  assert.deepEqual(metadataWithIdentity(undefined, { accountId: "  ", uid: "", accountScope: " " }), {})
+
+  // 不改入参
+  assert.equal(auth.metadata.email, "旧名字")
+  assert.equal(auth.metadata.userId, "old-uid")
+})
+
+test("accountScopeOf：顶层 → metadata → 安装记录，拿不到就是空串（不拿名字冒充）", () => {
+  assert.equal(accountScopeOf({ accountScope: "top" }, { accountScope: "rec" }), "top")
+  assert.equal(accountScopeOf({ metadata: { accountScope: "meta" } }, { accountScope: "rec" }), "meta")
+  assert.equal(accountScopeOf({}, { accountScope: "rec" }), "rec")
+  assert.equal(accountScopeOf({}, null), "")
+  assert.equal(accountScopeOf({ accountScope: "   ", metadata: { accountScope: " " } }, { accountScope: "" }), "")
+  // 显示名 / uid 不是作用域
+  assert.equal(accountScopeOf({ accountId: "名字", uid: "uid" }, { accountId: "名字" }), "")
 })

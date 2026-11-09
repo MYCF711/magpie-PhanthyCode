@@ -17,8 +17,13 @@
 //   `idempotency-key`。这一点由原始字节确认，不要“顺手加一个”。
 
 import { ApiError } from "./api.mjs"
-import { ensureInstallation, readInstallation, removeInstallation, renewInferenceKey, saveInstallation } from "./device-key.mjs"
-import { fingerprint } from "./credential.mjs"
+import {
+  adoptInstallationByScope,
+  ensureInstallation,
+  renewInferenceKey,
+  saveInstallation,
+} from "./device-key.mjs"
+import { accountScopeOf } from "./credential.mjs"
 import { CODES } from "./http.mjs"
 import { installationIdFromPublicKey } from "./installation-id.mjs"
 import { fetchProfile, registerDevice, requestInferenceToken } from "./phanthy-api.mjs"
@@ -193,6 +198,22 @@ export async function ensureInstallationReady({ account, auth, fetchImpl, now = 
   const task = (async () => {
     let { record } = ensureInstallation({ account: key, now })
     if (!force && isInstallationReady(record)) return record
+    /** 是否需要走注册：本轮里 record 会被「找回」替换，所以按需重算 */
+    const needsRegistration = () => force || !record.registeredAt
+
+    // ⓪ **零请求**找回：登录态或记录里已经有 accountScope 时，先按作用域找这个账号
+    //    已经注册过的设备 —— 键会变（旧版是凭据指纹，新版是作用域指纹），设备只有一台。
+    //    这一步不联网，找不到才继续往下（profile → 注册）。
+    //    ⚠ 返回的记录**已经规范化**（device / inference 补齐、id 与 identity 公钥同源）：
+    //      0.2.3 的旧记录只有 identity 那一对，不补的话 `registeredAt` 会让注册被跳过、
+    //      而第一次换票又因为缺 inference 公钥回 409（M-1 的假错误）。
+    if (!force && !record.registeredAt) {
+      const adopted = adoptInstallationByScope(key, accountScopeOf(auth, record))
+      if (adopted) {
+        record = adopted
+        if (isInstallationReady(record)) return record
+      }
+    }
 
     // ⚠ 0.2.15 起**不再要求 `PHANTHY_ALLOW_DEVICE_REGISTER=1`**。
     //
@@ -207,8 +228,7 @@ export async function ensureInstallationReady({ account, auth, fetchImpl, now = 
     //
     //   保留 `REGISTER_GATE_ENV` 作为**显式 opt-out**：设成 `0` 表示「绝对不要注册」，
     //   给需要严格只读数据面的场景用。默认行为 = 允许注册。
-    const needsRegistration = force || !record.registeredAt
-    if (needsRegistration && !force && !isRegistrationAllowed()) {
+    if (needsRegistration() && !force && !isRegistrationAllowed()) {
       throw new ApiError(
         "推理面未接通：设备注册被 `PHANTHY_ALLOW_DEVICE_REGISTER=0` 显式关闭了。" +
           "去掉这个环境变量（或设成 1）后重新发一次请求。" +
@@ -217,15 +237,7 @@ export async function ensureInstallationReady({ account, auth, fetchImpl, now = 
       )
     }
 
-    // 熔断：409 是终态，期内一条注册都不发（这是「加载时零注册」的保证）
-    if (needsRegistration && !force && isRegistrationBlocked(record, now)) {
-      throw deviceBindingConflict({
-        installationIdMasked: maskInstallationId(record.installationId),
-        detail: String(record.registrationUnavailableMessage ?? ""),
-      })
-    }
-
-    // ① accountScope 只能来自账号档案。
+    // ① accountScope 只能来自账号档案（登录时已经取过的会随 metadata 传下来）。
     //    ⚠ 它**只**进 device canonical 第 2 段，**不参与** installationId 派生 ——
     //    id 由 identity 公钥派生（`di_` + base64url(sha256(裸公钥))），见 installation-id.mjs。
     //    早期实现拿 scope 哈希出 id，是 409 desktop_installation_conflict 的根因。
@@ -235,26 +247,29 @@ export async function ensureInstallationReady({ account, auth, fetchImpl, now = 
       record = saveInstallation(key, { ...record, accountScope: scope })
     }
 
-    // ①b 令牌刷新会换 uid（`uidOf` 在 api 型凭据上回退到「凭据指纹」），
-    //     而 magpie 对 `type: "api"` 只存 `{type, key}`、**不存 uid** ——
-    //     于是每 30 分钟刷新一次就换一个 key，每次都会新建一条设备安装记录、
-    //     重新注册一次设备（真机上攒出 4 条孤儿记录，界面里额度窗口重复显示）。
-    //
-    //     稳定锚点只有 `accountScope`：拿到它之后，如果这个账号已经有一条**已注册**的
-    //     记录挂在别的 key 下，就把它迁过来复用 —— identity 公钥与 installationId 都不动，
-    //     服务端看到的是同一台设备。
-    const scopeKey = fingerprint(record.accountScope)
-    if (scopeKey && scopeKey !== key && !record.registeredAt) {
-      const existing = readInstallation(scopeKey)
-      if (existing?.registeredAt && existing?.publicKey) {
-        record = saveInstallation(scopeKey, { ...existing })
-        removeInstallation(key)
-        return record
+    // ①b 用**刚取到**的 accountScope 再找回一次：
+    //     老记录可能没写 scope，只能先问 profile 才知道该找哪一条。
+    //     找到就复用（identity 公钥与 installationId 都不动，服务端看到的仍是同一台设备），
+    //     并把记录迁到当前键下、清掉旧键 —— 同一个账号自己的记录，不复制别人的私钥。
+    //     ⚠ 同样是**规范化之后**的记录：注册那一步按 `registeredAt` 跳过也不会缺密钥。
+    if (!force && !record.registeredAt) {
+      const adopted = adoptInstallationByScope(key, record.accountScope)
+      if (adopted) {
+        record = adopted
+        if (isInstallationReady(record)) return record
       }
-      // 没有可复用的就正常往下走（这个 scope 是第一次见）
     }
 
-    // ② 单次完整注册（同一个 installationId 必然一致，不做 A/B 双探针：会撞幂等键）
+    // ② 熔断：409 是终态，期内一条注册都不发（这是「加载时零注册」的保证）。
+    //    判据放在「找回」之后：409 是**账号级**的，换过几次键也一样要退避。
+    if (needsRegistration() && !force && isRegistrationBlocked(record, now)) {
+      throw deviceBindingConflict({
+        installationIdMasked: maskInstallationId(record.installationId),
+        detail: String(record.registrationUnavailableMessage ?? ""),
+      })
+    }
+
+    // ③ 单次完整注册（同一个 installationId 必然一致，不做 A/B 双探针：会撞幂等键）
     if (force || !record.registeredAt) {
       // inference 是 sidecar 会话密钥：**每次注册现生成**（重启实验证明它每次变，
       // 而 identity / device 跨重启不变）。body.inference_public_key 与后面的
@@ -293,8 +308,7 @@ export async function ensureInstallationReady({ account, auth, fetchImpl, now = 
       }
     }
 
-    // ③ activities/summary：无幂等键，拿到 desktop_inference_token 并落盘
-    // ③ activities/summary：无幂等键，拿到 desktop_inference_token 并落盘
+    // ④ activities/summary：无幂等键，拿到 desktop_inference_token 并落盘
     //
     // ⚠ 判据是「**过期了也要换**」，不是「没有才换」。这个令牌是短效的（实测 exp 距签发
     //   约 3 分钟），只判「有没有」会让插件拿死票去签名 → 403 request_not_authorized，

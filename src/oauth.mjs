@@ -173,6 +173,9 @@ export async function requestToken({
       accept: "application/json",
     },
     body: form.toString(),
+    // ⚠ L-5：换票请求体里带 authorization_code / refresh_token，绝不能自动
+    //   跟随跨站 3xx（undici 会剥 authorization，但挂在这条通道上的凭据更不该出网）。
+    redirect: "manual",
     signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
   })
 

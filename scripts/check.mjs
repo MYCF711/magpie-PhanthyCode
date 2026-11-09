@@ -369,13 +369,46 @@ if (entryFile && existsSync(join(ROOT, String(entryFile)))) {
 }
 
 // ── ⑧ CHANGELOG 有当前版本 ───────────────────────────────────────────
+//
+// 判据是**段首标题** `## <version>`，不是正文子串。
+//
+// 旧实现写的是 `chg.includes(pkg.version)`，于是正文里任何一处上游版本号都能把它蒙过去：
+// CHANGELOG 里有一句 `magpie ≥ 0.1.1763`，字符串里含「0.1.1」，0.1.1 这一节**根本没写**
+// 门却打勾 —— 发版时 Release 正文抽出来是空的，用户看不到更新说明，而 CI 一路通过。
+//
+// 两件事必须做对，否则换个版本号又漏：
+//   ① 版本号里的 `.` 在正则里是「任意字符」，要转义（`0.1.1` 不许命中 `## 0.1x1`）；
+//   ② 版本号后面要有边界（`## 0.1.1` 不许替 `## 0.1.10` 过关）。
+
+/**
+ * 版本号的字面量正则：行首（最多 3 个空格）+ 1~6 个 `#` + 空白 + 转义后的版本号 + 右边界。
+ * 右边界不许再接版本号字符（数字 / 字母 / `.` `+` `-`），否则 0.1.1 会命中 0.1.10 / 0.1.1-rc.1。
+ * @param {string} version
+ * @returns {RegExp}
+ */
+function changelogVersionPattern(version) {
+  const escaped = String(version).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+  return new RegExp(`^[ \\t]{0,3}#{1,6}[ \\t]+${escaped}(?![0-9A-Za-z.+-])`, "m")
+}
+
+/**
+ * CHANGELOG 里有没有 `## <version>`（标题级）这一节。
+ * @param {string} text
+ * @param {string} version
+ * @returns {boolean}
+ */
+function changelogHasVersion(text, version) {
+  if (!version) return false
+  return changelogVersionPattern(version).test(String(text))
+}
 
 const chgPath = join(ROOT, "CHANGELOG.md")
 if (existsSync(chgPath) && pkg?.version) {
   const chg = readFileSync(chgPath, "utf8")
-  ok(chg.includes(pkg.version),
+  ok(changelogHasVersion(chg, pkg.version),
      `CHANGELOG 有 ${pkg.version} 这一段`,
-     "发版时 Release 正文从它抽；没有就等于没写更新说明")
+     "发版时 Release 正文从它抽；没有就等于没写更新说明",
+     `在 CHANGELOG 顶部加一节标题 \`## ${pkg.version} — YYYY-MM-DD\`；正文里出现同样的数字不算`)
 }
 
 // ── ⑨ 敏感信息 ────────────────────────────────────────────────────────

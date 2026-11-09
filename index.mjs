@@ -40,11 +40,16 @@
 //
 // 推理面（/v1/messages）的**请求签名**已经实现（src/proof.mjs + 下方 loader）。
 // 设备注册的三项契约 2026-11-09 已由真机实测确认（三把独立密钥 / device 私钥签
-// device_signature / identity 私钥签 v1 头，见 src/registration.mjs 文件头），
-// 但注册仍默认关闭 —— 它会在服务端留下设备绑定，属于**写操作**：
-//   · 设备注册默认关闭（PHANTHY_ALLOW_DEVICE_REGISTER≠1）→ 501 not_implemented
-//   · 服务端真的回 409 desktop_installation_conflict  → 409 device_binding_conflict（终态）
-// 要在本机跑通推理链，显式开 PHANTHY_ALLOW_DEVICE_REGISTER=1。
+// device_signature / identity 私钥签 v1 头，见 src/registration.mjs 文件头）。
+//
+// 设备注册（写操作）**什么时候发生**：
+//   · 登录时只分配**本机**身份（生成/复用这个账号自己的三把密钥 + installationId，
+//     零请求）—— 用户点完登录就有稳定设备；
+//   · 云端注册在第一次真正需要它的地方完成：推理（loader）或用户主动签到（checkin，
+//     见下方 ⑥：注册成功立即签到，失败如实返回）；
+//   · 服务端回 409 desktop_installation_conflict → 409 device_binding_conflict（账号级
+//     终态）+ 24 小时熔断，期内零注册请求；
+//   · 只有显式设 `PHANTHY_ALLOW_DEVICE_REGISTER=0` 才完全禁止注册（严格只读数据面）。
 
 import { ApiError, TIMEOUT, asSignInExpired, isAuthFailure } from "./src/api.mjs"
 import { catalogEntries } from "./src/catalog.mjs"
@@ -60,9 +65,10 @@ import {
   staticModels,
 } from "./src/context.mjs"
 import { looksLikeIdentifier } from "./src/account-name.mjs"
-import { fingerprint, uidOf } from "./src/credential.mjs"
-import { findInstallationByScope, readInstallation } from "./src/device-key.mjs"
+import { accountScopeOf, fingerprint, metadataWithIdentity, uidOf } from "./src/credential.mjs"
+import { ensureInstallation, readInstallation, saveInstallation } from "./src/device-key.mjs"
 import { ensureInstallationReady, isInstallationReady } from "./src/production-auth.mjs"
+import { launchIsolatedLogin } from "./src/isolated-login.mjs"
 import { detectLocalLogin, readImportedAccess, summarizeDetection } from "./src/local-import.mjs"
 import { OFFICIAL_UA, isLoginBroken } from "./src/http.mjs"
 import {
@@ -73,6 +79,7 @@ import {
   refreshAccessToken,
 } from "./src/oauth.mjs"
 import { generatePkce, randomState, startLoopback } from "./src/oauth-pkce.mjs"
+import { assertTrustedUrl } from "./src/origin.mjs"
 import { fetchCatalog, fetchProfile, request as phanthyRequest } from "./src/phanthy-api.mjs"
 import { createDailyActivity, dailyLoginReward, dailyLoginStreak } from "./src/activity.mjs"
 import {
@@ -147,6 +154,9 @@ function resolveFetch(options = {}) {
 
 export const PhanthyCodeAuthPlugin = async (_ctx = {}, _options = {}) => {
   const fetchImpl = resolveFetch(_options)
+  // 测试注入假启动器，生产才启动真实的一次性 Chromium profile。
+  // 这样 OAuth 钩子的集成测试不会弹出浏览器或碰到真实用户会话。
+  const openIsolatedLogin = typeof _options.isolatedLogin === "function" ? _options.isolatedLogin : launchIsolatedLogin
 
   // 同一 refresh_token 的并发续期合并成一次，成功后 60 秒内回放结果。
   // 键必须是凭据身份（refresh_token），不能用 provider id —— 同渠道多账号会串结果。
@@ -196,74 +206,117 @@ export const PhanthyCodeAuthPlugin = async (_ctx = {}, _options = {}) => {
             const state = randomState()
             const pkce = generatePkce()
             const listener = await startLoopback({ state, path: CALLBACK_PATH })
-            const url = buildAuthorizeUrl({
-              base: BASE,
-              redirectUri: listener.redirectUri,
-              state,
-              codeChallenge: pkce.challenge,
-            })
-
-            return {
-              url,
-              instructions: "在浏览器里完成 Phanthy 登录，这个窗口会自动继续。",
-              method: "auto",
-              opened: false,
-
-              async callback(code) {
+            // ⚠ listener 一旦起来，这一整段都必须保证「异常也要关掉它」（L-2）：
+            //   漏关的 loopback Server 会把端口占住、把进程吊到 300s 超时
+            //   （review 实测 [still running after 120000ms]），用户点一次「+」就多一个。
+            try {
+              const url = buildAuthorizeUrl({
+                base: BASE,
+                redirectUri: listener.redirectUri,
+                state,
+                codeChallenge: pkce.challenge,
+              })
+              // 每次加号都开一份全新的临时 profile，避免日常浏览器里的旧 Phanthy
+              // 会话让授权页直接跳过登录。这里只等进程起来，不等用户登录。
+              const launch = await openIsolatedLogin({ url })
+              if (!launch?.ok) {
                 try {
-                  const redirected = typeof code === "string" && code ? { code, state } : await listener.wait()
-                  if (redirected?.state && redirected.state !== state) {
-                    return { type: "failed", error: "state 校验失败（可能有另一个页面撞到了回调端口），请重试" }
-                  }
-                  const token = await exchangeAuthorizationCode({
-                    code: redirected?.code,
-                    state,
-                    codeVerifier: pkce.verifier,
-                    redirectUri: listener.redirectUri,
-                    base: BASE,
-                    fetchImpl,
-                  })
-
-                  // ⚠ 换票响应里**没有** profile：账号名必须自己补一次。
-                  //   不补的话 `accountId` 是空串，卡片显示「Signed in」（0.2.14 真机）。
-                  //   锚点与「从本机导入」同一套：`display_name`（服务端已打码）进
-                  //   `accountId` + `metadata.email`，`account.uuid` 的指纹进 `uid`
-                  //   （稳定，不随 token 刷新变）。
-                  let accountId = ""
-                  let uid = fingerprint(token.access)
-                  let accountScope = ""
-                  try {
-                    const profile = await fetchProfile({ access: token.access }, { fetchImpl })
-                    accountScope = String(profile?.account?.uuid ?? "").trim()
-                    if (accountScope) uid = fingerprint(accountScope)
-                    const displayName = String(
-                      profile?.account?.display_name ?? profile?.account?.email ?? "",
-                    ).trim()
-                    if (displayName && !looksLikeIdentifier(displayName)) accountId = displayName
-                  } catch {
-                    // 拿不到 profile 也不阻塞登录：退回凭据指纹、卡片显示供应商名
-                  }
-
-                  return {
-                    type: "success",
-                    refresh: token.refresh || "",
-                    access: token.access,
-                    expires: token.expires,
-                    accountId,
-                    // api 型登录态只有 `metadata.email` 能落盘，见下方注释；
-                    // oauth 型会同时留 accountId，但写两份不会有副作用。
-                    ...(accountId ? { email: accountId, metadata: { email: accountId } } : {}),
-                    uid,
-                    ...(accountScope ? { accountScope } : {}),
-                  }
-                } catch (error) {
-                  return { type: "failed", error: String(error?.message ?? error) }
-                } finally {
-                  try {
-                    listener.close()
-                  } catch {}
+                  listener.close()
+                } catch {}
+                return {
+                  type: "failed",
+                  error: `无法打开隔离登录浏览器：${launch?.error ?? "未知启动错误"}`,
                 }
-              },
+              }
+              // 用户没完成登录就关窗时，让 listener.wait 立刻失败，不必等超时。
+              launch.child?.once?.("exit", () => {
+                try {
+                  listener.close()
+                } catch {}
+              })
+
+              return {
+                url,
+                instructions: "已打开独立登录窗口（不带你日常浏览器的 Cookie 或旧账号会话）。请在里面完成 Phanthy 登录，完成后窗口会自动关闭。",
+                method: "auto",
+                opened: true,
+
+                async callback(code) {
+                  try {
+                    const redirected = typeof code === "string" && code ? { code, state } : await listener.wait()
+                    if (redirected?.state && redirected.state !== state) {
+                      return { type: "failed", error: "state 校验失败（可能有另一个页面撞到了回调端口），请重试" }
+                    }
+                    const token = await exchangeAuthorizationCode({
+                      code: redirected?.code,
+                      state,
+                      codeVerifier: pkce.verifier,
+                      redirectUri: listener.redirectUri,
+                      base: BASE,
+                      fetchImpl,
+                    })
+
+                    // ⚠ 换票响应里**没有** profile：账号名必须自己补一次。
+                    //   不补的话 `accountId` 是空串，卡片显示「Signed in」（0.2.14 真机）。
+                    //   锚点与「从本机导入」同一套：`display_name`（服务端已打码）进
+                    //   `accountId` + `metadata.email`，`account.uuid` 的指纹进 `uid`
+                    //   （稳定，不随 token 刷新变）。
+                    let accountId = ""
+                    let uid = fingerprint(token.access)
+                    let accountScope = ""
+                    try {
+                      const profile = await fetchProfile({ access: token.access }, { fetchImpl })
+                      accountScope = String(profile?.account?.uuid ?? "").trim()
+                      if (accountScope) uid = fingerprint(accountScope)
+                      const displayName = String(
+                        profile?.account?.display_name ?? profile?.account?.email ?? "",
+                      ).trim()
+                      if (displayName && !looksLikeIdentifier(displayName)) accountId = displayName
+                    } catch {
+                      // 拿不到 profile 也不阻塞登录：退回凭据指纹、卡片显示供应商名
+                    }
+
+                    // 登录即分配本机设备身份（纯本地：只生成/复用这个账号自己的三把
+                    // ed25519，不发任何请求）。云端注册留到 checkin / loader。
+                    allocateLocalDevice(uid, accountScope)
+
+                    return {
+                      type: "success",
+                      refresh: token.refresh || "",
+                      access: token.access,
+                      expires: token.expires,
+                      accountId,
+                      // ⚠ metadata 才是「稳定身份」唯一可靠的落点（api 型登录态只持久化
+                      //   `{type, key, metadata}`，顶层 uid / accountScope / expires 会丢）。
+                      //   写两份（顶层 + metadata）对 oauth 型没有副作用。
+                      ...(accountId ? { email: accountId } : {}),
+                      uid,
+                      ...(accountScope ? { accountScope } : {}),
+                      metadata: metadataWithIdentity(undefined, { accountId, uid, accountScope }),
+                    }
+                  } catch (error) {
+                    return { type: "failed", error: String(error?.message ?? error) }
+                  } finally {
+                    try {
+                      await launch.close()
+                    } catch {}
+                    try {
+                      listener.close()
+                    } catch {}
+                  }
+                },
+              }
+            } catch (error) {
+              // ⚠ L-2：buildAuthorizeUrl / openIsolatedLogin **抛异常**时，
+              //   上面的 `ok:false` 分支根本没机会执行 —— 必须在这里关掉 loopback，
+              //   否则端口泄漏到 300s 超时，进程也退不出去。
+              try {
+                listener.close()
+              } catch {}
+              return {
+                type: "failed",
+                error: `无法打开隔离登录浏览器：${String(error?.message ?? error)}`,
+              }
             }
           },
         },
@@ -322,7 +375,9 @@ export const PhanthyCodeAuthPlugin = async (_ctx = {}, _options = {}) => {
               //   不是每个请求都走（HOOKS 铁律 2 针对的是「不要在 authorize 里等用户」）。
               let accountScope = ""
               let accountId = ""
-              let uid = ""
+              // 兜底身份：拿不到 profile 时至少冻结「这次登录」的身份（与 uidOf 的
+              // 凭据指纹同值），不会在会话中途再变一次。
+              let uid = fingerprint(imported.access)
               try {
                 const profile = await fetchProfile({ access: imported.access }, { fetchImpl })
                 accountScope = String(profile?.account?.uuid ?? "").trim()
@@ -338,26 +393,31 @@ export const PhanthyCodeAuthPlugin = async (_ctx = {}, _options = {}) => {
                 // 拿不到 profile 也不阻塞登录：退回凭据指纹（会随刷新变，但不至于登不上）
               }
 
+              // 登录即分配本机设备身份（纯本地）。api 型凭据换一张 token 时，
+              // 只要 accountScope 没变，这里就会命中同一条记录 ⇒ 同一个 installationId。
+              allocateLocalDevice(uid, accountScope)
+
               return {
                 type: "success",
                 key: imported.access,
                 accountId,
-                // ⚠ 三处都写同一个值，但**真正生效的是 `metadata.email`**。
+                // ⚠ **api 型登录态只有 `metadata` 能落盘**。
                 //
                 //   宿主的取法（`host-*.js` 的 `whoOf`）：
                 //     a?.accountId ?? a?.metadata?.email ?? a?.email ?? ""
                 //
                 //   而 magpie 的 `/api/plugin-signin` 对 **api 型**登录态
                 //   只持久化 `{ type, key, metadata }` —— `accountId` / `uid` /
-                //   `expires` 全被丢掉（2026-11-09 实测：干净重新登录后
+                //   `accountScope` / `expires` 全被丢掉（2026-11-09 实测：干净重新登录后
                 //   `plugin-auth.json` 里只剩这三项，卡片回退成「API key …xxxx」）。
                 //
-                //   所以 `metadata.email` 才是 api 型唯一能落盘的显示名，必须写；
-                //   另外两个照写不误（oauth 型 / 未来 magpie 版本可能会留）。
-                ...(accountId ? { email: accountId, metadata: { email: accountId } } : {}),
+                //   所以稳定身份（`userId` / `accountScope`）必须和显示名一起写进
+                //   `metadata`；顶层照写不误（oauth 型 / 未来 magpie 版本可能会留）。
+                ...(accountId ? { email: accountId } : {}),
                 ...(uid ? { uid } : {}),
                 ...(accountScope ? { accountScope } : {}),
                 ...(imported.expires > 0 ? { expires: imported.expires } : {}),
+                metadata: metadataWithIdentity(undefined, { accountId, uid, accountScope }),
               }
             } catch (error) {
               return { type: "failed", error: String(error?.message ?? error) }
@@ -393,14 +453,29 @@ export const PhanthyCodeAuthPlugin = async (_ctx = {}, _options = {}) => {
             }
           }
 
+          // ⚠ metadata 必须**合并**后原样返回，不能只给 `{ email }`：
+          //   api 型登录态只持久化 `{type, key, metadata}`，而 uidOf() 优先读
+          //   `metadata.userId` —— 冲掉它，同一个账号刷新一次就换一台设备
+          //   （每 30 分钟重新注册一次，真机上会攒出孤儿记录）。
+          const metadata = metadataWithIdentity(auth, { accountId, uid, accountScope })
+          // 旧登录态（0.2.x）只有 `metadata.email` + 顶层 uid/accountScope：
+          // 续期时顺手把稳定身份抄进 metadata 一次，之后换 token 也不会漂。
+          if (!metadata.userId && auth?.uid) metadata.userId = String(auth.uid).trim()
+          if (!metadata.accountScope && auth?.accountScope) {
+            metadata.accountScope = String(auth.accountScope).trim()
+          }
+          // 与 uidOf() 同源的稳定身份（metadata.userId → uid → 凭据指纹）
+          const stableUid = uidOf({ ...auth, metadata })
+
           return {
             access: t.access,
             // 服务端可能不轮换 refresh_token，没给就沿用旧的（否则用户被要求重登）
             refresh: t.refresh || auth.refresh,
             expires: t.expires,
-            ...(accountId ? { accountId, email: accountId, metadata: { email: accountId } } : {}),
-            ...(uid ? { uid } : {}),
+            ...(accountId ? { accountId, email: accountId } : {}),
+            ...(stableUid ? { uid: stableUid } : {}),
             ...(accountScope ? { accountScope } : {}),
+            metadata,
           }
         } catch (error) {
           if (isCredentialRejected(error)) throw asSignInExpired("登录已失效，请重新登录")
@@ -423,13 +498,25 @@ export const PhanthyCodeAuthPlugin = async (_ctx = {}, _options = {}) => {
           },
 
           async fetch(input, init) {
+            const req = input instanceof Request ? input : null
+            const url =
+              typeof input === "string" ? input : input instanceof URL ? input.toString() : (req?.url ?? "")
+            try {
+              // 在再次读取登录态、请求体或设备私钥之前先定死出站边界。
+              // 非预期 origin 一律按调用方参数错误拒绝，不能带 Bearer / 签名头外发。
+              assertTrustedUrl(url)
+            } catch (error) {
+              throw new ApiError(
+                `请求 URL 不在可信 origin（${new URL(BASE).origin}）上，已拒绝外发` +
+                  (error?.reason ? `（${error.reason}）` : ""),
+                { status: 400, code: "invalid_request" },
+              )
+            }
+
             const fresh = await getAuth()
             const bearer = bearerOf(fresh)
             if (!bearer) throw asSignInExpired("登录已失效，请重新登录")
 
-            const req = input instanceof Request ? input : null
-            const url =
-              typeof input === "string" ? input : input instanceof URL ? input.toString() : (req?.url ?? "")
             const method = String(init?.method ?? req?.method ?? "POST").toUpperCase()
             const incoming = new Headers(init?.headers ?? req?.headers ?? {})
             const body =
@@ -544,6 +631,9 @@ export const PhanthyCodeAuthPlugin = async (_ctx = {}, _options = {}) => {
                     method,
                     headers,
                     body,
+                    // 签名头与 Bearer 只允许留在已验证的 origin；3xx 交给 SDK/调用方处理，
+                    // 不让 fetch 自动把它们转发到另一台主机。
+                    redirect: "manual",
                     signal: callerSignal ?? timeoutSignal,
                   }),
                 { callerSignal, timeoutSignal },
@@ -653,38 +743,35 @@ export const PhanthyCodeAuthPlugin = async (_ctx = {}, _options = {}) => {
         const key = `${provider?.id || PROVIDER}\n${account}`
         return checkinLock.run(key, async () => {
           // 签到/奖励全是 v1 签名请求：没有登记好的设备身份，连状态都读不到。
-          // 这里只读本机安装记录（插件自己生成的公钥/私钥），不碰桌面端任何凭据。
+          // 设备身份由本插件自己生成（`src/device-key.mjs`），不碰桌面端任何凭据。
           //
-          // ⚠ 记录键会变：`uidOf()` 优先用 `auth.uid`，而续期钩子会把 uid 从
-          //   「凭据指纹」迁到「accountScope 指纹」（稳定锚点）。迁移后旧键下的
-          //   记录还在，新键下没有 —— 只按 uid 找会得到「未注册设备」，
-          //   而推理面明明能用（真机：签到报错、推理 200）。
+          // ⚠ 记录键会变：`uidOf()` 优先用 `metadata.userId`（登录时写入的
+          //   `fingerprint(accountScope)`），旧记录挂在「凭据指纹」键下。
+          //   `ensureInstallationReady` 会按 `accountScope` 把那条记录找回来并迁移，
+          //   identity 公钥与 installationId 都不动 —— 服务端看到的仍是同一台设备。
           //
-          //   而且 oauth 型登录态**不存 `accountScope`**（magpie 只留
-          //   `type/refresh/access/expires/accountId/uid/metadata`），所以拿不到
-          //   就只能现问一次 profile —— 签到是每天一次的动作，多一个请求可以接受。
+          // ⚠ 用户**主动点签到** = 显式动作，所以这里可以就地完成设备注册
+          //   （profile → register → activities，走既有的 ensureInstallationReady）。
+          //
+          //   旧实现直接回「先发一次模型请求」，用户点不动、还以为插件坏了；
+          //   而官方客户端本来就是启动即注册设备（见 production-auth.mjs 文件头）。
+          //   注册失败（409 / 403 / 缺 account.uuid / 网络）**如实**返回失败，
+          //   绝不伪造 claimed，也不会继续去领奖（不打 rewards / claim）。
+          //
+          //   顺序即契约：profile → register → activities → rewards → claim。
           let installation = readInstallation(account)
-          if (!installation?.installationId) {
-            let scope = String(auth?.accountScope ?? "").trim()
-            if (!scope) {
-              try {
-                const profile = await fetchProfile(auth, { fetchImpl })
-                scope = String(profile?.account?.uuid ?? "").trim()
-              } catch {
-                // 拿不到 profile 就走「未注册」的失败说明，不编造
-              }
+          if (!isInstallationReady(installation)) {
+            try {
+              installation = await ensureInstallationReady({ account, auth, fetchImpl })
+            } catch (error) {
+              if (isAuthFailure(error)) throw asSignInExpired("登录已失效，请重新登录")
+              return { outcome: "failed", message: checkinFailureMessage(error) }
             }
-            if (scope) installation = findInstallationByScope(scope)
           }
           if (!installation?.installationId || !installation?.privateKey) {
-            return {
-              // ⚠ 不能用 `inactive`（HOOKS 二：inactive = 「没有签到活动」）——
-              // 真实原因是「设备身份没注册」，宿主会把它写进 plugin-checkin.json 显示成无活动。
-              outcome: "failed",
-              message:
-                "签到需要已注册的设备身份：该账号尚未完成设备注册，因此不发送任何请求" +
-                "（先发一次模型请求完成设备注册；数据面不受影响）",
-            }
+            // ⚠ 不能用 `inactive`（HOOKS 二：inactive = 「没有签到活动」）——
+            //   真实原因是「设备身份不完整」，宿主会把它写进 plugin-checkin.json 显示成无活动。
+            return { outcome: "failed", message: "签到失败：本机设备身份不完整（未发送任何领取请求）" }
           }
 
           const identity = {
@@ -805,7 +892,7 @@ export const PhanthyCodeAuthPlugin = async (_ctx = {}, _options = {}) => {
 
         // 缓存 key 必须是「谁的数据」：凭据指纹 + 账号作用域。同一账号换 token 也不能串，
         // 不同账号（不同 accountScope）更不能共用目录/额度缓存。
-        const scope = String(auth?.accountScope ?? readInstallation(String(uidOf(auth) ?? ""))?.accountScope ?? "")
+        const scope = accountScopeOf(auth, readInstallation(String(uidOf(auth) ?? "")))
         const scopeTag = scope ? fingerprint(scope) : "noscope"
         // 文件名只能是安全字符：作用域用指纹，账号部分再过滤一遍
         const accountTag = String(uidOf(auth) ?? fingerprint(bearerOf(auth))).replace(/[^A-Za-z0-9._-]/g, "_")
@@ -883,11 +970,55 @@ export const PhanthyCodeAuthPlugin = async (_ctx = {}, _options = {}) => {
 
     const headers = new Headers(res.headers)
     headers.set("x-magpie-sign-in", "kept")
+    // ⚠ L-7：`res.clone().text()` 已经解出**明文**，这两个头必须删掉：
+    //   · content-encoding: gzip —— 留着等于宣称「这段明文是 gzip」，下游再解一次会报错；
+    //   · content-length —— 明文长度与压缩后的长度不同，交给运行时重算。
+    headers.delete("content-encoding")
+    headers.delete("content-length")
     return new Response(text === "" ? null : text, {
       status,
       statusText: res.statusText,
       headers,
     })
+  }
+
+  /**
+   * 登录即分配本机设备身份 —— **纯本地**：生成/复用这个账号自己的三把 ed25519，
+   * 不发任何请求（云端注册留到 checkin / loader，那才是需要联网的一步）。
+   *
+   * 只在拿到 `account.uuid`（稳定 uid）时落盘：拿不到 scope 就用会变的凭据指纹建记录，
+   * 那条记录迟早会被丢弃，不如让 checkin 建。
+   *
+   * 失败不阻塞登录：缓存目录写不进去时，登录本身仍应成功。
+   */
+  function allocateLocalDevice(account, accountScope) {
+    const uidValue = String(account ?? "").trim()
+    const scope = String(accountScope ?? "").trim()
+    if (!uidValue || !scope) return null
+    try {
+      let { record } = ensureInstallation({ account: uidValue })
+      // 服务端给的作用域也存上：它要进 device canonical 第 2 段，
+      // 存了就不必为了填这一格再问一次 profile。
+      if (!record.accountScope) record = saveInstallation(uidValue, { ...record, accountScope: scope })
+      return record
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * 设备注册失败 → 签到失败的**如实**说明（把状态码 / 错误码 / 上游原文带出来）。
+   *
+   * 绝不在这里改写成 claimed/done：用户点签到就是为了拿到奖励，
+   * 假报成功比报错更糟（卡片绿灯、账号里一分没多）。
+   */
+  function checkinFailureMessage(error) {
+    const status = Number(error?.status ?? 0)
+    const code = String(error?.code ?? "").trim()
+    const detail = String(error?.message ?? error ?? "").trim()
+    const head = "签到失败：设备身份未就绪（本次没有领取任何奖励）"
+    const reason = [status ? `HTTP ${status}` : "", code].filter(Boolean).join(" ")
+    return [head, reason, detail.slice(0, 260)].filter(Boolean).join("：")
   }
 
   /** 从安装记录还原身份私钥（v1 canonical 用它签；只在签名的那一刻取） */

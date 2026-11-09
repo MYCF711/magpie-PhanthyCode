@@ -13,13 +13,12 @@
 // ⚠ 只读 Cookie，不写浏览器数据；窗口关闭后临时 profile 会被删掉。
 // ⚠ 本模块不依赖任何第三方包；Node 22+ 的全局 WebSocket 足够。
 
-import { spawn } from "node:child_process"
+import { execFileSync, spawn } from "node:child_process"
 import { existsSync, rmSync } from "node:fs"
 import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createServer } from "node:net"
-import { execFileSync } from "node:child_process"
 
 const WIN_EXES = [
   "chrome.exe",
@@ -39,19 +38,38 @@ const WIN_EXES = [
   "msedge.exe",
 ]
 
-/** Windows 注册表 App Paths 查浏览器；查不到返回空串。 */
-export function registryAppPath(exe) {
-  if (process.platform !== "win32") return ""
+/**
+ * Windows 注册表 App Paths 查浏览器；查不到返回空串。
+ *
+ * ⚠ 这段是**同步**的（`execFileSync`），而且查不到的键会把子进程的 stderr 原样
+ *   写到父进程 —— 15 个 exe × 2 个根 × 2 个 tail = 60 次 `reg query`，每次 1 行
+ *   中文「错误: 系统找不到指定的注册表项或值。」，同步阻塞 ≈1 秒。M-2 的现场。
+ *   所以：`stdio[2]` 必须是 `"ignore"`（丢弃 stderr），`windowsHide` 必须开
+ *   （不弹控制台），`timeout` 给整体上限。
+ *
+ * @param {string} exe 可执行文件名（如 `msedge.exe`）
+ * @param {{platform?:string, exec?:Function, exists?:(p:string)=>boolean}} [o] 仅测试注入
+ * @returns {string} 命中的绝对路径；没有返回空串
+ */
+export function registryAppPath(exe, { platform = process.platform, exec = execFileSync, exists = existsSync } = {}) {
+  if (platform !== "win32") return ""
   for (const root of ["HKCU", "HKLM"]) {
     for (const tail of [
       `SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\${exe}`,
       `SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\App Paths\\${exe}`,
     ]) {
       try {
-        const out = execFileSync("reg", ["query", `${root}\\${tail}`, "/ve"], { encoding: "utf8", timeout: 5000 })
+        const out = exec("reg", ["query", `${root}\\${tail}`, "/ve"], {
+          encoding: "utf8",
+          timeout: 5000,
+          // ① 找不到的键会往 stderr 打中文错误 —— 丢掉（否则每次登录 56 行噪声）
+          // ② 同步子进程不许弹控制台窗口
+          stdio: ["ignore", "pipe", "ignore"],
+          windowsHide: true,
+        })
         const line = out.split("\n").find((l) => /REG_SZ/i.test(l))
         const path = line?.split("REG_SZ")[1]?.trim()
-        if (path && existsSync(path)) return path
+        if (path && exists(path)) return path
       } catch {}
     }
   }
@@ -133,9 +151,52 @@ function dedupe(list) {
   })
 }
 
-/** 第一个真实存在的候选；没有返回 null。 */
-export function findBrowser({ platform = process.platform, env = process.env, exists = existsSync, lookup = registryAppPath } = {}) {
+/**
+ * 真正去发现浏览器：**先静态路径，全部没命中才查注册表**。
+ *
+ * 为什么不先查注册表：`browserCandidates` 里那些 `join(pf, …)` 本身就是拼出来的
+ * 路径，绝大多数机器上 Chrome / Edge 就在固定位置；先查注册表等于每次登录白跑
+ * 60 次同步 `reg query`（M-2：「+」点一下卡 ≈1 秒 + 56 行中文错误）。
+ */
+function discoverBrowser({ platform = process.platform, env = process.env, exists = existsSync, lookup = registryAppPath } = {}) {
+  const fromStaticPaths = browserCandidates({ platform, env, lookup: () => "" }).find((b) => exists(b.path))
+  if (fromStaticPaths) return fromStaticPaths
   return browserCandidates({ platform, env, lookup }).find((b) => exists(b.path)) ?? null
+}
+
+// 默认发现结果的一次性记忆化。**只对「完全不传参数」的默认调用生效**：
+// 带 exists / lookup / env / platform 的调用（测试、脚本）必须每次真跑，
+// 否则上一个用例的假 exists 会被下一个用例复用 —— 测试串扰。
+let defaultBrowserCache = null
+let defaultBrowserCached = false
+
+/** 清空默认 `findBrowser()` 的记忆化（测试用；生产一个进程只发现一次）。 */
+export function resetBrowserCache() {
+  defaultBrowserCache = null
+  defaultBrowserCached = false
+}
+
+/**
+ * 第一个真实存在的候选；没有返回 null。
+ *
+ * 无参调用 = 生产路径：静态路径优先、只查一次注册表，并把结果记忆化
+ * （`authorize()` 里这段是同步的，重复发现就是重复阻塞）。
+ * 传了参数 = 一次性发现，不写缓存。
+ *
+ * @param {{platform?:string, env?:Record<string,string>, exists?:(p:string)=>boolean, lookup?:(exe:string)=>string}} [options]
+ * @returns {{name:string, path:string} | null}
+ */
+export function findBrowser(options) {
+  if (options !== undefined) return discoverBrowser(options)
+  if (defaultBrowserCached) return defaultBrowserCache
+  defaultBrowserCache = discoverBrowser({
+    platform: process.platform,
+    env: process.env,
+    exists: existsSync,
+    lookup: registryAppPath,
+  })
+  defaultBrowserCached = true
+  return defaultBrowserCache
 }
 
 /** 从 CDP 的 cookie 列表里挑需要的名字；返回 header 字符串与命中的键。 */
@@ -265,4 +326,9 @@ export async function chromiumLogin({ browser, url, cookieNames = [], timeoutMs 
   }
 }
 
-export const _internal = { WIN_EXES, freePort, cdpCookies }
+export const _internal = {
+  WIN_EXES,
+  freePort,
+  cdpCookies,
+  hasDefaultBrowserCache: () => defaultBrowserCached,
+}

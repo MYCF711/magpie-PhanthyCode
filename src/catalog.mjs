@@ -12,12 +12,15 @@
 //
 // 三条降级方向（与 `src/models.mjs` 的三态一致）：
 //   ① 整个接口失败        → 调用方退回静态表 / 上次快照，**不返回空列表**
-//   ② 接口成功但单条缺 id  → 不列这一条（不猜）
+//   ② 接口成功但单条缺字段 → 不列这一条（不猜）：
+//        · 缺 id   → `parseCatalog` 就丢掉
+//        · 缺价格  → `catalogEntries` 不列（价格未知 ≠ 免费，见 `creditsOf`）
 //   ③ 登录失效            → 由调用方抛 `signIn: "expired"`
 //
 // ⚠ 价格是 credits/百万 token，不是美元：magpie 的 `cost` 字段是美元语义，
 //   所以这里不把 credits 填进 `cost`（填了会让「花多少」显示成错的数量级）。
-//   目录里带的 credits 原样放在条目的 `pricing` 上，宿主会忽略未知字段。
+//   目录里带的 credits 原样放在条目的 `pricing` 上，宿主会忽略未知字段；
+//   **未知价格不写键**（早期写成 `Number(x) || 0`，等价于宣称「免费」）。
 //
 // 字段级证据（`claude-sidecar.exe` 的目录映射，2026-11-08 逆向）：
 //   · 三档 `max_effort` / `gpt_reasoning_effort` / `glm_reasoning_effort` 官方按
@@ -26,7 +29,7 @@
 //   · 上下文窗口的回退链是 `context_window → context_window_tokens → contextWindow`，
 //     且只接受 16000..1e7 的整数（@108104990）。
 
-import { defaultEntry, isUsable } from "./models.mjs"
+import { defaultEntry, isUsable, priceOf } from "./models.mjs"
 
 /** 模型目录端点 */
 export const CATALOG_PATH = "/api/phanthy_code/models"
@@ -101,6 +104,30 @@ export function rateOf(model) {
 }
 
 /**
+ * 积分价格的三态（与 `src/models.mjs` 的 `priceOf` 同一份契约）：
+ *
+ *   合法非负数（含显式 `0`）→ 返回该数
+ *   缺失 / `null` / `{}` / `""` / 非法字符串 / 布尔 / 负数 / `NaN` → `undefined`
+ *
+ * ⚠ 早期这里写的是 `Number(x) || 0`，把「不知道价格」变成了「价格是 0」——
+ *   于是目录里**没有 pricing** 的模型被 `isFreeByPrice` 判成免费、被标 `free: true`，
+ *   Free-first 路由会一直派发它们（AGENTS 坑 2 / HOOKS 十一之二）。
+ *   方向只有一个是安全的：不知道 ≠ 免费。
+ *
+ * 数字字符串（`"1140"`）按数值收 —— 服务端常见形态，与 `contextWindowOf` 同一口径；
+ * 但空串/空白串**不能**被 `Number("") === 0` 吃成免费。
+ */
+export function creditsOf(value) {
+  // `priceOf` 是仓库里价格三态的唯一实现（`src/models.mjs`），这里只补类型闸门：
+  // 布尔 / 数组 / 对象都不该被 `String(...)` 转成数字。
+  if (typeof value !== "number" && typeof value !== "string") return undefined
+  const { known } = priceOf({ inputPoints: value })
+  if (!known) return undefined
+  const credits = Number(value)
+  return credits >= 0 ? credits : undefined
+}
+
+/**
  * 官方是否**明确标了 0 积分**（= 免费）。
  *
  * ⚠ 不能用 `rateOf(...) === 0` 代替：极小但非零的价格四舍五入后也是 0，
@@ -139,6 +166,10 @@ export function parseCatalog(body) {
     // ② 单条缺 id → 不列（不猜）
     if (!id) continue
     const capabilities = raw?.capabilities && typeof raw.capabilities === "object" ? raw.capabilities : {}
+    // 价格三态：只有合法数值才写进 `pricing`；未知就**连键都不写**（不冒充 0）。
+    // 单条缺价 → 下游 `catalogEntries` 不列（见那里的注释）。
+    const inputCredits = creditsOf(raw?.pricing?.input_credits_per_million_tokens)
+    const outputCredits = creditsOf(raw?.pricing?.output_credits_per_million_tokens)
     models.push({
       id,
       alias: trimmed(raw?.alias),
@@ -148,8 +179,8 @@ export function parseCatalog(body) {
       tier: trimmed(raw?.tier),
       recommended: raw?.recommended === true,
       pricing: {
-        inputCreditsPerMillion: Number(raw?.pricing?.input_credits_per_million_tokens) || 0,
-        outputCreditsPerMillion: Number(raw?.pricing?.output_credits_per_million_tokens) || 0,
+        ...(inputCredits === undefined ? {} : { inputCreditsPerMillion: inputCredits }),
+        ...(outputCredits === undefined ? {} : { outputCreditsPerMillion: outputCredits }),
       },
       capabilities: {
         effort: flagOf(capabilities.effort),
@@ -179,22 +210,32 @@ export function parseCatalog(body) {
  *
  * @param {ReturnType<typeof parseCatalog>} catalog
  * @param {{entry?: Function, usable?: (m: object) => boolean}} [options]
- * @returns {{models: Record<string, object>, withoutContext: number, filteredOut: number}}
+ * @returns {{models: Record<string, object>, withoutContext: number, filteredOut: number, missingPrice: number}}
  */
 export function catalogEntries(catalog, { entry = defaultEntry, usable = isUsable } = {}) {
   const models = {}
   let withoutContext = 0
   let filteredOut = 0
+  let missingPrice = 0
 
   for (const model of catalog?.models ?? []) {
     if (!usable(model)) {
       filteredOut++
       continue
     }
+    // ② 目录成功但这一条缺价 → **不列**（仓库契约：单条缺字段 = 不猜，`src/models.mjs`
+    //    的 `priceOf` 为此返回 `{ known: false }`）。列出来的后果是卡片显示 `0x`、
+    //    Free-first 把它当免费一直派发 —— 两条都比「少一个模型」更糟。
+    const inputCredits = creditsOf(model?.pricing?.inputCreditsPerMillion)
+    if (inputCredits === undefined) {
+      missingPrice++
+      continue
+    }
     const options = {}
     if (model.context !== undefined) options.context = model.context
     const built = entry(model.id, model.name, false, options)
-    const rate = rateOf(model)
+    // 倍率只用**已确认的**那一个价格算（不读模型对象，避免再走一次 `Number(...)`）
+    const rate = rateOf({ pricing: { inputCreditsPerMillion: inputCredits } })
     models[model.id] = {
       ...built,
       // 服务端说会思考才给 reasoning；defaultEntry 默认 true，这里按目录覆盖
@@ -205,11 +246,11 @@ export function catalogEntries(catalog, { entry = defaultEntry, usable = isUsabl
       ...(rate === undefined ? {} : { rate }),
       // ⚠ 坑 2：`rate: 0` 的意思是「没给倍率」，**不是免费**，magpie 不会从 rate 推 free。
       //   所以「0 积分」必须**显式**标 free，否则 Free-first 路由永远不派发它。
-      //   判据是原始积分严格等于 0，不是四舍五入后的 rate（见 isFreeByPrice）。
-      ...(isFreeByPrice(model) ? { free: true } : {}),
+      //   判据是原始积分严格等于 0（`=== 0`），不是四舍五入后的 rate（见 isFreeByPrice）。
+      ...(inputCredits === 0 ? { free: true } : {}),
     }
     if (model.context === undefined) withoutContext++
   }
 
-  return { models, withoutContext, filteredOut }
+  return { models, withoutContext, filteredOut, missingPrice }
 }
