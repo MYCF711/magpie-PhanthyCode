@@ -414,17 +414,26 @@ test("oauth 登录也把稳定身份写进 metadata（卡片名 + 稳定 uid）"
   assert.deepEqual(paths(), [TOKEN_PATH, PROFILE_PATH], "oauth 登录只允许换票 + profile")
 })
 
-test("oauth 隔离浏览器启动失败：关闭 loopback、如实失败且不换票", async () => {
+test("oauth 隔离浏览器启动失败：退回默认浏览器（不阻断登录），并如实标记 opened:false", async () => {
   const { paths, fetchImpl } = recorder({})
   const plugin = await PhanthyCodeAuthPlugin({}, {
     fetch: fetchImpl,
     isolatedLogin: async () => ({ ok: false, error: "spawn ENOENT" }),
   })
   const flow = await plugin.auth.methods[0].authorize()
-  assert.equal(flow.type, "failed")
-  assert.match(flow.error, /隔离登录浏览器|ENOENT/)
-  assert.equal(flow.callback, undefined, "启动失败不能返回一个会继续换票的 callback")
-  assert.deepEqual(paths(), [], "启动失败不得发起任何云端请求")
+
+  // ⚠ 隔离窗口是**尽力而为**：没有 Chromium / 启动报错时不能让用户失去 OAuth 入口，
+  //   必须退回 0.1.x 的行为 —— 把 url 交回宿主，由系统默认浏览器打开。
+  assert.equal(flow.type, undefined, "启动失败不等于登录失败")
+  assert.match(flow.url, /\/oauth\/authorize\?/, "必须交回可打开的授权地址")
+  assert.equal(flow.opened, false, "没开成隔离窗口 ⇒ 交给宿主打开")
+  assert.match(flow.instructions, /默认浏览器/)
+  assert.equal(typeof flow.callback, "function", "交回 url 后仍要能收 code")
+  assert.deepEqual(paths(), [], "authorize 阶段不得发起任何云端请求")
+
+  // 收尾：走一次换票（喂一个坏 code），确保 loopback 在 finally 里被关掉、不留 Server。
+  const result = await flow.callback("bad-code")
+  assert.equal(result.type, "failed")
 })
 
 // ── ④ refresh 不许把稳定身份冲掉 ─────────────────────────────────────

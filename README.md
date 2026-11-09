@@ -12,6 +12,8 @@ provider   phanthycode（模型名 phanthycode/<id>）
 - **官方 OAuth 登录** —— 授权码 + PKCE S256，本机 loopback 回调，`state` 校验与失败页齐备。
   点加号时默认开一份**一次性的干净浏览器**（临时 `user-data-dir`，关掉就删）：不读、不复用
   你日常浏览器的 Cookie / LocalStorage / 扩展，所以不会「点加号却直接进了旧账号」。
+  没装 Chromium 内核浏览器 / 启动失败 / 被单实例浏览器（360、QQ、搜狗…）接管时，
+  **自动退回用你的默认浏览器**打开授权页，这条登录方式不会因此消失。
 - **续期不丢号** —— 一次性 `refresh_token` 同账号串行，多账号并发刷新不会互相顶掉。
 - **登录一次就有稳定设备身份** —— 拿到账号作用域后**纯本地**分配/复用本机设备密钥（零请求），
   身份写进登录态的 `metadata`：**同一个号换 token 不换设备**，不同账号（不同 uuid）各自独立。
@@ -80,7 +82,7 @@ magpie plugin add D:/path/to/magpie-PhanthyCode
 
 | 方式 | 说明 |
 |---|---|
-| 浏览器 OAuth（推荐） | 自己换票，access + refresh 都归插件，能自动续期。**默认用一次性隔离浏览器**：临时 `user-data-dir`，关窗即删，不读你日常 profile |
+| 浏览器 OAuth（推荐） | 自己换票，access + refresh 都归插件，能自动续期。**默认用一次性隔离浏览器**：临时 `user-data-dir`，关窗即删，不读你日常 profile。找不到可用浏览器时退回默认浏览器（提示语会写明） |
 | 从本机导入 | **只导入云端短效 access token**；需要官方桌面端已经登录过。**明确拒绝 `refresh_token`**，不会顶掉桌面端登录（是显式备选，插件不会自动替你切过去） |
 
 ## 环境变量

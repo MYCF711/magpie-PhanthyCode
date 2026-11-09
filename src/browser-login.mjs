@@ -189,14 +189,20 @@ export function resetBrowserCache() {
 export function findBrowser(options) {
   if (options !== undefined) return discoverBrowser(options)
   if (defaultBrowserCached) return defaultBrowserCache
-  defaultBrowserCache = discoverBrowser({
+  const found = discoverBrowser({
     platform: process.platform,
     env: process.env,
     exists: existsSync,
     lookup: registryAppPath,
   })
-  defaultBrowserCached = true
-  return defaultBrowserCache
+  // ⚠ 只在**找到**时才记忆化：把 null 也缓存下来，用户装完 Chrome 还得重启 magpie
+  //   才认得（叠加「没浏览器就退回默认浏览器」的兜底，等于装完也没用）。
+  //   找不到时最多每次登录重新发现一遍，代价是几条静态路径 + 注册表查询。
+  if (found) {
+    defaultBrowserCache = found
+    defaultBrowserCached = true
+  }
+  return found
 }
 
 /** 从 CDP 的 cookie 列表里挑需要的名字；返回 header 字符串与命中的键。 */
